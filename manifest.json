@@ -2,6 +2,7 @@
   "app": "blockmd",
   "schema_version": 1,
   "id": "block-image-host",
+  "category": "edit",
   "name": {
     "zh": "图床上传",
     "en": "Image Host"
