@@ -8,4 +8,4 @@
 - **Zero-friction**: Automatically uploads local images and rewrites links when you save.
 - **Safe by default**: Custom path templates and filters; local originals are never deleted.
 
-**Install**: Open Block Settings -> App Store and search **Image Host**, or enter `eachann1024/block-image-host`.
+**Install**: Open Block Settings -> App Store and search **Image Host**, or enter `blockmd-plugins/block-image-host`.
