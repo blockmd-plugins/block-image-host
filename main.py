@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
     "remote_prefix": "",
     "auto_upload": True,
     "naming_rule": "ym_hash",
+    "menubar_copy_format": "markdown",
     "selected_notebooks": [],
 }
 
@@ -47,6 +48,9 @@ EN_PROVIDER_LABELS = {
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
 VALID_NAMING_RULES = {"ym_hash", "note_dir", "original"}
+VALID_COPY_FORMATS = {"markdown", "url"}
+MENUBAR_ITEM_ID = "uploader"
+MAX_MENUBAR_RECENT = 10
 IMAGE_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -357,6 +361,61 @@ class ImageHostPlugin:
     def _save_logs(self, bridge, logs):
         bridge.call_host("host.storage.set", {"key": "logs", "value": logs[:MAX_LOGS]})
 
+    def _load_menubar_recent(self, bridge):
+        res = bridge.call_host("host.storage.get", {"key": "menubar_recent"})
+        raw = res.get("value") if isinstance(res, dict) else None
+        if not isinstance(raw, list):
+            return []
+        items = []
+        for entry in raw[:MAX_MENUBAR_RECENT]:
+            if not isinstance(entry, dict):
+                continue
+            filename = str(entry.get("filename") or "").strip()
+            url = str(entry.get("url") or "").strip()
+            if not filename or not url:
+                continue
+            item = {"filename": filename, "url": url}
+            if entry.get("time"):
+                item["time"] = str(entry["time"]).strip()
+            items.append(item)
+        return items
+
+    def _save_menubar_recent(self, bridge, recent):
+        bridge.call_host("host.storage.set", {"key": "menubar_recent", "value": recent[:MAX_MENUBAR_RECENT]})
+
+    def _record_menubar_recent(self, recent, uploaded_items):
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        updated = list(recent)
+        for filename, url in uploaded_items:
+            updated = [item for item in updated if item.get("url") != url]
+            updated.insert(0, {"filename": filename, "url": url, "time": now_str})
+        return updated[:MAX_MENUBAR_RECENT]
+
+    def _sync_menubar_menu(self, bridge, recent):
+        entries = []
+        for idx, item in enumerate(recent[:MAX_MENUBAR_RECENT]):
+            url = item["url"]
+            if len(url.encode("utf-8")) > 4096:
+                continue
+            entries.append(
+                {
+                    "id": f"recent-{idx}",
+                    "title": item["filename"],
+                    "subtitle": url,
+                    "command": "copy-link",
+                    "payload": url,
+                }
+            )
+        params = {"id": MENUBAR_ITEM_ID}
+        if entries:
+            params["menu"] = entries
+        else:
+            params["clear_menu"] = True
+        try:
+            bridge.call_host("host.menubar.set", params)
+        except Exception:
+            pass
+
     def _append_log(self, logs, title, status_text, tone="info", tooltip=""):
         now_str = datetime.datetime.now().strftime("%H:%M")
         entry = {"title": title, "time": now_str, "tone": tone}
@@ -433,6 +492,10 @@ class ImageHostPlugin:
         naming_rule = str(raw.get("naming_rule", cfg["naming_rule"])).strip()
         if naming_rule in VALID_NAMING_RULES:
             cfg["naming_rule"] = naming_rule
+
+        copy_format = str(raw.get("menubar_copy_format", cfg["menubar_copy_format"])).strip()
+        if copy_format in VALID_COPY_FORMATS:
+            cfg["menubar_copy_format"] = copy_format
 
         if "selected_notebooks" in raw and isinstance(raw["selected_notebooks"], list):
             seen = set()
@@ -1191,12 +1254,16 @@ class ImageHostPlugin:
     def _build_remote_key(self, naming_rule, prefix, nb_root, note_path, local_path, file_bytes, asset_time):
         filename = os.path.basename(local_path)
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
-        root = os.path.realpath(nb_root)
-        # Include the original paths and bytes so sanitizing a name or editing an
-        # image cannot make another image's URL point to different bytes.
-        identity = [root, os.path.relpath(local_path, root), hashlib.sha256(file_bytes).hexdigest()]
+        if nb_root and note_path:
+            root = os.path.realpath(nb_root)
+            # Include the original paths and bytes so sanitizing a name or editing an
+            # image cannot make another image's URL point to different bytes.
+            identity = [root, os.path.relpath(local_path, root), hashlib.sha256(file_bytes).hexdigest()]
+        else:
+            # Menu bar uploads have no note context; key by original filename and bytes.
+            identity = ["menubar", filename, hashlib.sha256(file_bytes).hexdigest()]
         folder = ""
-        if naming_rule == "note_dir":
+        if naming_rule == "note_dir" and note_path:
             canonical_note = os.path.normpath(note_path)
             identity.append(canonical_note)
             stem = canonical_note.replace("\\", "/")
@@ -1207,11 +1274,154 @@ class ImageHostPlugin:
                 for part in stem.split("/")
                 if part and part not in (".", "..")
             ) or "notes"
-        elif naming_rule == "ym_hash":
+        elif naming_rule in ("ym_hash", "note_dir"):
             folder = datetime.datetime.fromtimestamp(asset_time, datetime.timezone.utc).strftime("%Y/%m")
 
         digest = hashlib.sha256(json.dumps(identity).encode("ascii")).hexdigest()
         return "/".join(part for part in (prefix, folder, digest, safe_name) if part)
+
+    def _parse_credentials(self, config):
+        if config["provider"] in ("r2", "s3"):
+            return self._parse_s3_credentials(config)
+        return self._parse_github_credentials(config)
+
+    def _format_copied_links(self, config, uploaded_items):
+        copy_format = config.get("menubar_copy_format", "markdown")
+        lines = []
+        for filename, url in uploaded_items:
+            if copy_format == "url":
+                lines.append(url)
+            else:
+                safe_alt = filename.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+                lines.append(f"![{safe_alt}]({url})")
+        return "\n".join(lines)
+
+    def _handle_menubar_upload(self, bridge, command_id, context):
+        source = str(context.get("source") or "").strip()
+        raw_files = context.get("files") if isinstance(context.get("files"), list) else []
+        local_files = []
+        seen_paths = set()
+        for raw_path in raw_files:
+            path = str(raw_path or "").strip()
+            if not path or path in seen_paths or not os.path.isfile(path):
+                continue
+            seen_paths.add(path)
+            local_files.append(path)
+
+        if not local_files:
+            if command_id == "upload-clipboard" and source not in ("menubar", "menubar_drop"):
+                msg = self._text(
+                    "请从菜单栏图标菜单点击「上传剪贴板」或拖入图片上传",
+                    "Click Upload Clipboard in the menu bar icon or drop images on it",
+                )
+                return {"ok": False, "tone": "info", "status": msg}
+            msg = self._text(
+                "未检测到可上传的本地图片文件",
+                "No readable local image files found to upload",
+            )
+            return {"ok": False, "tone": "warning", "status": msg}
+
+        config, stats, logs = self._load_state(bridge)
+        creds, cred_err = self._parse_credentials(config)
+        if cred_err:
+            return {
+                "ok": False,
+                "tone": "warning",
+                "status": self._text(
+                    "请先前往插件设置页配置图床凭证",
+                    "Configure your image host credentials in plugin settings first",
+                ),
+            }
+
+        uploaded_items = []
+        failed_count = 0
+        last_error = ""
+        for local_path in local_files:
+            filename = os.path.basename(local_path)
+            try:
+                remote_url = self._upload_file(config, creds, "", "", local_path)
+                uploaded_items.append((filename, remote_url))
+                stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
+                logs = self._append_log(
+                    logs,
+                    f"菜单栏 -> {filename}",
+                    "成功",
+                    tone="success",
+                    tooltip=remote_url,
+                )
+            except Exception as err:
+                if isinstance(err, urllib.error.HTTPError):
+                    detail = self._extract_http_error_detail(err)
+                elif isinstance(err, urllib.error.URLError):
+                    detail = self._text(
+                        f"网络不可达：{err.reason}",
+                        f"Network unreachable: {self._error_detail(err.reason)}",
+                    )
+                else:
+                    detail = self._error_detail(err)
+                failed_count += 1
+                last_error = detail
+                logs = self._append_log(logs, filename, "失败", tone="danger", tooltip=detail)
+
+        self._save_stats(bridge, stats)
+        self._save_logs(bridge, logs)
+
+        if not uploaded_items:
+            return {
+                "ok": False,
+                "tone": "error",
+                "status": self._text(
+                    f"上传失败：{last_error}",
+                    f"Upload failed: {last_error}",
+                ),
+            }
+
+        recent = self._load_menubar_recent(bridge)
+        recent = self._record_menubar_recent(recent, uploaded_items)
+        self._save_menubar_recent(bridge, recent)
+        self._sync_menubar_menu(bridge, recent)
+
+        copy_text = self._format_copied_links(config, uploaded_items)
+        count = len(uploaded_items)
+        if failed_count > 0:
+            status = self._text(
+                f"已上传 {count} 张并复制链接，{failed_count} 张失败",
+                f"Uploaded {count} image(s) and copied link(s); {failed_count} failed",
+            )
+            return {"ok": True, "tone": "warning", "status": status, "copy_text": copy_text}
+
+        if count == 1:
+            status = self._text("已上传并复制链接", "Uploaded and copied link")
+        else:
+            status = self._text(
+                f"已上传 {count} 张图片并复制链接",
+                f"Uploaded {count} images and copied links",
+            )
+        return {"ok": True, "tone": "success", "status": status, "copy_text": copy_text}
+
+    def _handle_copy_link(self, bridge, context):
+        payload = str(context.get("payload") or "").strip()
+        if payload:
+            return {
+                "ok": True,
+                "tone": "success",
+                "status": self._text("已复制图片链接", "Copied image link"),
+                "copy_text": payload,
+            }
+        recent = self._load_menubar_recent(bridge)
+        if not recent:
+            return {
+                "ok": False,
+                "tone": "info",
+                "status": self._text("暂无最近上传记录", "No recent uploads yet"),
+            }
+        latest_url = recent[0]["url"]
+        return {
+            "ok": True,
+            "tone": "success",
+            "status": self._text("已复制最近上传链接", "Copied recent upload link"),
+            "copy_text": latest_url,
+        }
 
     def _upload_file(self, config, creds, nb_root, note_path, local_path):
         with open(local_path, "rb") as fh:
@@ -1672,10 +1882,13 @@ class ImageHostPlugin:
                     tone = "info"
             status = status or "成功"
             if self._is_english:
-                for provider, label in PROVIDER_LABELS.items():
-                    if title == f"连接测试（{label}）":
-                        title = f"Connection test ({self._provider_label(provider)})"
-                        break
+                if title.startswith("菜单栏 -> "):
+                    title = "Menu bar -> " + title[len("菜单栏 -> "):]
+                else:
+                    for provider, label in PROVIDER_LABELS.items():
+                        if title == f"连接测试（{label}）":
+                            title = f"Connection test ({self._provider_label(provider)})"
+                            break
                 if status == "失败" or tone == "danger":
                     status = "Failed"
                 elif status == "成功" or tone == "success":
@@ -1695,10 +1908,7 @@ class ImageHostPlugin:
         return entries
 
     def _is_configured(self, config):
-        if config["provider"] in ("r2", "s3"):
-            _, err = self._parse_s3_credentials(config)
-        else:
-            _, err = self._parse_github_credentials(config)
+        _, err = self._parse_credentials(config)
         return not err
 
     def _build_page(self, config, stats, logs, selected, note_items, status_override=None):
@@ -2002,6 +2212,16 @@ class ImageHostPlugin:
                             ],
                         },
                         {
+                            "kind": "segmented",
+                            "id": "menubar_copy_format",
+                            "label": self._text("菜单栏复制格式", "Menu bar copy format"),
+                            "value": config["menubar_copy_format"],
+                            "options": [
+                                {"value": "markdown", "label": "Markdown"},
+                                {"value": "url", "label": "URL"},
+                            ],
+                        },
+                        {
                             "kind": "switch",
                             "id": "auto_upload",
                             "label": self._text(
@@ -2031,7 +2251,13 @@ class ImageHostPlugin:
     # ---- JSON-RPC dispatch ----
 
     def _save_immediate_config(self, bridge, stored_cfg, config, incoming_values):
-        immediate_keys = ("selected_notebooks", "auto_upload", "naming_rule", "gh_cdn")
+        immediate_keys = (
+            "selected_notebooks",
+            "auto_upload",
+            "naming_rule",
+            "gh_cdn",
+            "menubar_copy_format",
+        )
         accepted = {key: config[key] for key in immediate_keys if key in incoming_values}
         if any(stored_cfg.get(key) != value for key, value in accepted.items()):
             stored_cfg.update(accepted)
@@ -2059,6 +2285,12 @@ class ImageHostPlugin:
                     for p in raw_nbs
                     if str(p or "").strip()
                 ]
+            try:
+                recent = self._load_menubar_recent(bridge)
+                if recent:
+                    self._sync_menubar_menu(bridge, recent)
+            except Exception:
+                pass
             return {"ready": True}
 
         if method == "plugin.render":
@@ -2179,6 +2411,23 @@ class ImageHostPlugin:
             )
             page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
             return {"ok": False, "tone": "warning", "values": config, "page": page, "status": status}
+
+        if method == "plugin.command":
+            command_id = str(params.get("command_id") or "").strip()
+            context = params.get("context") if isinstance(params.get("context"), dict) else {}
+            if command_id in ("upload-clipboard", "upload-dropped"):
+                return self._handle_menubar_upload(bridge, command_id, context)
+            if command_id == "copy-link":
+                return self._handle_copy_link(bridge, context)
+            english_cmd = self._english_diagnostic(command_id)
+            return {
+                "ok": False,
+                "tone": "warning",
+                "status": self._text(
+                    f"未知命令：{command_id}",
+                    f"Unknown command: {english_cmd}" if english_cmd else "Unknown command",
+                ),
+            }
 
         if method == "plugin.event":
             event_name = params.get("event")

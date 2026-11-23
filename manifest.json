@@ -27,7 +27,9 @@
     "notes:read",
     "notes:write",
     "network",
-    "events:note_saved"
+    "events:note_saved",
+    "ui:menubar",
+    "ui:commands"
   ],
   "permission_reasons": {
     "storage": {
@@ -49,11 +51,98 @@
     "events:note_saved": {
       "zh": "在保存笔记时自动检测并上传其中的本地图片",
       "en": "Automatically detect and upload local images when a note is saved"
+    },
+    "ui:menubar": {
+      "zh": "在系统菜单栏显示上传图标，接收拖入或剪贴板图片并列出最近上传",
+      "en": "Show a menu bar icon to upload dropped or clipboard images and list recent uploads"
+    },
+    "ui:commands": {
+      "zh": "注册上传剪贴板、上传拖入文件与复制最近链接命令",
+      "en": "Register commands for clipboard upload, dropped upload, and copying recent links"
     }
   },
   "surfaces": [
     "settings_page"
   ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "upload-clipboard",
+        "title": {
+          "zh": "上传剪贴板图片",
+          "en": "Upload Clipboard Image"
+        }
+      },
+      {
+        "id": "upload-dropped",
+        "title": {
+          "zh": "上传拖入图片",
+          "en": "Upload Dropped Images"
+        }
+      },
+      {
+        "id": "copy-link",
+        "title": {
+          "zh": "复制最近上传链接",
+          "en": "Copy Recent Upload Link"
+        }
+      }
+    ],
+    "menubar_items": [
+      {
+        "id": "uploader",
+        "icon": {
+          "view_box": "0 0 24 24",
+          "stroke_paths": [
+            "M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6Z",
+            "M4.5 16.5l4.2-4.2a1.4 1.4 0 0 1 2 0L14 15.6"
+          ],
+          "accent_paths": [
+            "M16.5 14V7.5",
+            "M14 10l2.5-2.5L19 10",
+            "M9 9.25a1.25 1.25 0 1 0 0 .01"
+          ]
+        },
+        "tooltip": {
+          "zh": "图床上传（拖入图片或点击上传剪贴板）",
+          "en": "Image Host (drop images or upload clipboard)"
+        },
+        "menu": [
+          {
+            "id": "upload-clipboard",
+            "title": {
+              "zh": "上传剪贴板",
+              "en": "Upload Clipboard"
+            },
+            "command": "upload-clipboard",
+            "input": "clipboard"
+          }
+        ],
+        "drop": {
+          "command": "upload-dropped",
+          "accept": [
+            "files",
+            "image"
+          ],
+          "extensions": [
+            "png",
+            "jpg",
+            "jpeg",
+            "gif",
+            "webp",
+            "svg",
+            "bmp",
+            "ico",
+            "avif",
+            "heic",
+            "heif",
+            "tif",
+            "tiff"
+          ]
+        }
+      }
+    ]
+  },
   "icon": {
     "view_box": "0 0 24 24",
     "fill_paths": [
