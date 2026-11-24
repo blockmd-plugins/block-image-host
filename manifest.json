@@ -23,12 +23,21 @@
     ]
   },
   "permissions": [
+    "storage",
     "notes:read",
     "notes:write",
     "network",
-    "events:note_saved"
+    "events:note_saved",
+    "system:clipboard_read",
+    "system:clipboard_write",
+    "ui:menubar",
+    "ui:commands"
   ],
   "permission_reasons": {
+    "storage": {
+      "zh": "保存图床服务商凭证、命名规则与上传记录",
+      "en": "Save image host credentials, naming rules, and upload logs"
+    },
     "notes:read": {
       "zh": "读取笔记正文与本地图片引用，筛选需要上传的图片",
       "en": "Read note content and local image links to find images to upload"
@@ -44,6 +53,22 @@
     "events:note_saved": {
       "zh": "在保存笔记时自动检测并上传其中的本地图片",
       "en": "Automatically detect and upload local images when a note is saved"
+    },
+    "system:clipboard_read": {
+      "zh": "点击菜单栏「上传剪贴板」时读取剪贴板中的图片或图片文件",
+      "en": "Read clipboard images or image files when clicking Upload Clipboard in the menu bar"
+    },
+    "system:clipboard_write": {
+      "zh": "上传完成或点击最近记录时将远程图片链接写入剪贴板",
+      "en": "Copy uploaded image URLs or recent links to the clipboard"
+    },
+    "ui:menubar": {
+      "zh": "在系统菜单栏显示上传图标，接收拖入或剪贴板图片并列出最近上传",
+      "en": "Show a menu bar icon to upload dropped or clipboard images and list recent uploads"
+    },
+    "ui:commands": {
+      "zh": "注册上传剪贴板、上传拖入文件与复制最近链接命令",
+      "en": "Register commands for clipboard upload, dropped upload, and copying recent links"
     }
   },
   "surfaces": [
