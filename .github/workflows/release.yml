@@ -199,6 +199,10 @@ jobs:
                   if method == "host.notes.write":
                       self.notes[params["path"]] = params["content"]
                       return {"ok": True}
+                  if method == "host.ui.toast":
+                      return {"ok": True, "shown": True}
+                  if method == "host.ui.open_settings":
+                      return {"ok": True}
                   raise ValueError(f"Unexpected host request: {method}")
 
               def send(self, message):

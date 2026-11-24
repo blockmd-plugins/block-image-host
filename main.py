@@ -166,6 +166,9 @@ class ImageHostPlugin:
         self.supports_checklist = False
         self.supports_add_folder = False
         self.supports_multi_notebook = False
+        self.supports_action_progress = False
+        self.supports_toast_banner = False
+        self.supports_open_settings = False
 
     @property
     def _is_english(self):
@@ -191,6 +194,25 @@ class ImageHostPlugin:
                 bridge.notify_progress(**params)
             elif hasattr(bridge, "send"):
                 bridge.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
+        except Exception:
+            pass
+
+    def _notify_upload_result(self, bridge, title, body="", tone="info", with_settings_action=False):
+        if not getattr(self, "supports_toast_banner", False) or not title:
+            return
+        params = {
+            "message": title,
+            "tone": tone,
+        }
+        if body:
+            params["body"] = body
+        if with_settings_action and getattr(self, "supports_open_settings", False):
+            params["action"] = {
+                "id": "open_image_host_settings",
+                "label": self._text("查看", "View"),
+            }
+        try:
+            bridge.call_host("host.ui.toast", params)
         except Exception:
             pass
 
@@ -1714,10 +1736,40 @@ class ImageHostPlugin:
         self._save_logs(bridge, logs)
 
         if target_note and failed_count:
+            if uploaded_count > 0:
+                toast_title = self._text(
+                    f"自动上传 {uploaded_count} 张，失败 {failed_count} 项",
+                    f"Auto-uploaded {uploaded_count}, {failed_count} failed",
+                )
+                toast_tone = "warning"
+            else:
+                toast_title = self._text(
+                    f"自动上传失败（{failed_count} 项）",
+                    f"Auto-upload failed ({failed_count})",
+                )
+                toast_tone = "error"
+            self._notify_upload_result(
+                bridge,
+                toast_title,
+                body=failure_detail,
+                tone=toast_tone,
+                with_settings_action=True,
+            )
             raise LocalizedError(self._text(
                 f"自动上传有 {failed_count} 项失败：{failure_detail}",
                 f"Auto-upload failures: {failed_count}. {failure_detail}",
             ))
+        if target_note and uploaded_count > 0:
+            note_label = target_note[1] if isinstance(target_note, tuple) and len(target_note) > 1 else ""
+            self._notify_upload_result(
+                bridge,
+                self._text(
+                    f"已自动上传 {uploaded_count} 张图片",
+                    f"Auto-uploaded {uploaded_count} image(s)",
+                ),
+                body=note_label,
+                tone="success",
+            )
 
         if failed_count > 0 and uploaded_count == 0:
             status = self._text(
@@ -2274,6 +2326,8 @@ class ImageHostPlugin:
             self.supports_add_folder = "checklist_add_folder" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
             self.supports_action_progress = "action_progress" in caps
+            self.supports_toast_banner = "toast_banner" in caps
+            self.supports_open_settings = "open_settings" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
                 self.known_notebooks = [
@@ -2310,6 +2364,13 @@ class ImageHostPlugin:
 
         if method == "plugin.action":
             action_id = str(params.get("action_id") or "")
+            if action_id == "open_image_host_settings":
+                if self.supports_open_settings:
+                    try:
+                        bridge.call_host("host.ui.open_settings", {})
+                    except Exception:
+                        pass
+                return {"ok": True}
             incoming_values = params.get("values") if isinstance(params.get("values"), dict) else {}
             prev_config, stats, logs = self._load_state(bridge)
             merged = dict(prev_config)
@@ -2399,6 +2460,13 @@ class ImageHostPlugin:
                     ok = True
                     tone = "success"
                     self._save_config(bridge, config)
+                if uploaded_count > 0 or failed_count > 0:
+                    self._notify_upload_result(
+                        bridge,
+                        status,
+                        tone=tone,
+                        with_settings_action=(failed_count > 0),
+                    )
                 _, _, note_items = self._scan_notebooks(bridge, selected)
                 page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
