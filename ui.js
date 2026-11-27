@@ -218,6 +218,39 @@ export function isConfigReady(config, tr) {
   return !errMsg;
 }
 
+export function connConfigSignature(config) {
+  const c = config || {};
+  if (c.provider === 'github') {
+    return JSON.stringify([
+      'github',
+      String(c.gh_repo || '').trim(),
+      String(c.gh_branch || 'main').trim() || 'main',
+      String(c.gh_token || '').trim(),
+    ]);
+  }
+  return JSON.stringify([
+    String(c.provider || 'r2'),
+    String(c.s3_endpoint || '').trim(),
+    String(c.s3_bucket || '').trim(),
+    String(c.s3_access_key || '').trim(),
+    String(c.s3_secret_key || '').trim(),
+    String(c.public_domain || '').trim(),
+  ]);
+}
+
+function withAutosave(item, enabled, actionId = 'save_config') {
+  return enabled ? { ...item, autosave: actionId } : item;
+}
+
+function localizeConnStatusMsg(connState, isEnglish, errorDetail) {
+  if (!connState || !connState.message) return '';
+  const msg = String(connState.message);
+  if (isEnglish && connState.locale !== 'en' && /[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/.test(msg)) {
+    return englishLogTooltip(msg, connState.ok ? 'success' : 'danger', errorDetail);
+  }
+  return msg;
+}
+
 export function buildPage({
   config,
   logs,
@@ -225,6 +258,9 @@ export function buildPage({
   noteItems,
   knownNotebooks,
   supportsAddFolder,
+  supportsFormAutosave = false,
+  supportsProgressBar = false,
+  connState = null,
   homeDir,
   isEnglish,
   tr,
@@ -347,6 +383,108 @@ export function buildPage({
         )
       : tr('https://img.example.com（可留空）', 'https://img.example.com (optional)');
 
+  const connValid = Boolean(connState && connState.target_sig === connConfigSignature(config));
+  const connFailed = Boolean(connValid && connState.ok === false);
+  const connOk = Boolean(connValid && connState.ok === true);
+  const targetDetail =
+    config.provider === 'github'
+      ? `${config.gh_repo || ''} · ${config.gh_branch || 'main'}`.replace(/^\s*·\s*/, '')
+      : String(config.s3_bucket || '').trim();
+
+  const channelBottomItems = [];
+  if (supportsFormAutosave) {
+    let headline;
+    let detail;
+    let tone = '';
+    let progress = 0.0;
+    let tooltip = '';
+    if (connFailed) {
+      headline = tr('无法连接图床', 'Cannot reach image host');
+      detail =
+        localizeConnStatusMsg(connState, isEnglish, errorDetail) ||
+        tr('请检查配置后重新检测', 'Check settings and retry');
+      tone = 'danger';
+      progress = 1.0;
+      tooltip = detail;
+    } else if (connOk) {
+      headline = tr(`${curProviderLabel} 已连通`, `${curProviderLabel} connected`);
+      detail = targetDetail || tr('远端已连通', 'Connected');
+      tone = 'success';
+      progress = 1.0;
+      tooltip = localizeConnStatusMsg(connState, isEnglish, errorDetail) || detail;
+    } else if (configured) {
+      headline = tr(`${curProviderLabel} 已配置`, `${curProviderLabel} ready`);
+      detail = targetDetail || tr('已保存配置', 'Configuration saved');
+      tone = 'accent';
+      progress = 0.0;
+      tooltip = detail;
+    } else {
+      headline = tr('未配置图床', 'Image host not configured');
+      detail = tr('填写后自动保存并检测连接', 'Fill in fields to save and test');
+      progress = 0.0;
+      tooltip = detail;
+    }
+
+    if (supportsProgressBar) {
+      const statusItem = {
+        kind: 'progress',
+        id: 'progress_image_host',
+        channel: 'image_host',
+        label: headline,
+        status: detail,
+        progress,
+      };
+      if (tone) statusItem.tone = tone;
+      if (tooltip) statusItem.tooltip = tooltip;
+      channelBottomItems.push(statusItem);
+    } else {
+      const row = { label: headline, value: detail || headline };
+      if (tooltip) row.tooltip = tooltip;
+      channelBottomItems.push({ kind: 'kv', rows: [row] });
+    }
+
+    if (connFailed) {
+      channelBottomItems.push({
+        kind: 'actions',
+        buttons: [
+          {
+            id: 'test_conn',
+            label: tr('重新检测', 'Retry Check'),
+            busy_label: tr('检测中...', 'Checking...'),
+            success_label: tr('已连通', 'Connected'),
+            error_label: tr('连接失败', 'Connection failed'),
+            retry_label: tr('重新检测', 'Retry Check'),
+            variant: 'secondary',
+          },
+        ],
+      });
+    }
+  } else {
+    channelBottomItems.push({
+      kind: 'actions',
+      buttons: [
+        {
+          id: 'test_conn',
+          label: tr('测试连接', 'Test connection'),
+          busy_label: tr('测试中...', 'Testing...'),
+          success_label: tr('连接正常', 'Connected'),
+          error_label: tr('连接失败', 'Connection failed'),
+          retry_label: tr('重新测试', 'Test again'),
+          variant: 'secondary',
+        },
+        {
+          id: 'save_config',
+          label: tr('保存配置', 'Save configuration'),
+          busy_label: tr('保存中...', 'Saving...'),
+          success_label: tr('已保存', 'Saved'),
+          error_label: tr('保存失败', 'Save failed'),
+          retry_label: tr('重试保存', 'Retry save'),
+          variant: 'primary',
+        },
+      ],
+    });
+  }
+
   return {
     title: tr('图床上传', 'Image Host'),
     status: pageStatus,
@@ -381,7 +519,7 @@ export function buildPage({
         id: 'channel-card',
         title: tr('通道与上传规则', 'Image host and upload rules'),
         collapsible: true,
-        default_collapsed: configured,
+        default_collapsed: configured && !(supportsFormAutosave && connFailed),
         items: [
           {
             kind: 'segmented',
@@ -398,171 +536,188 @@ export function buildPage({
             kind: 'group',
             visible_when: { control_id: 'provider', in: ['r2', 's3'] },
             fields: [
-              {
-                kind: 'input',
-                id: 's3_endpoint',
-                label: tr('Endpoint 地址', 'Endpoint URL'),
-                layout: 'stacked',
-                value: config.s3_endpoint,
-                placeholder: endpointPlaceholder,
-              },
-              {
-                kind: 'input',
-                id: 's3_bucket',
-                label: tr('Bucket 存储桶', 'Bucket'),
-                layout: 'stacked',
-                value: config.s3_bucket,
-                placeholder: tr('存储桶名（支持 bucket/prefix）', 'Bucket name (or bucket/prefix)'),
-              },
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 's3_endpoint',
+                  label: tr('Endpoint 地址', 'Endpoint URL'),
+                  layout: 'stacked',
+                  value: config.s3_endpoint,
+                  placeholder: endpointPlaceholder,
+                },
+                supportsFormAutosave,
+              ),
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 's3_bucket',
+                  label: tr('Bucket 存储桶', 'Bucket'),
+                  layout: 'stacked',
+                  value: config.s3_bucket,
+                  placeholder: tr('存储桶名（支持 bucket/prefix）', 'Bucket name (or bucket/prefix)'),
+                },
+                supportsFormAutosave,
+              ),
             ],
           },
           {
             kind: 'group',
             visible_when: { control_id: 'provider', in: ['r2', 's3'] },
             fields: [
-              {
-                kind: 'input',
-                id: 's3_access_key',
-                label: 'Access Key ID',
-                layout: 'stacked',
-                value: config.s3_access_key,
-                placeholder: tr('对象存储访问公钥 ID', 'Object storage access key ID'),
-              },
-              {
-                kind: 'secret',
-                id: 's3_secret_key',
-                label: 'Secret Access Key',
-                layout: 'stacked',
-                value: config.s3_secret_key,
-                placeholder: tr('对象存储访问密钥', 'Object storage secret access key'),
-              },
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 's3_access_key',
+                  label: 'Access Key ID',
+                  layout: 'stacked',
+                  value: config.s3_access_key,
+                  placeholder: tr('对象存储访问公钥 ID', 'Object storage access key ID'),
+                },
+                supportsFormAutosave,
+              ),
+              withAutosave(
+                {
+                  kind: 'secret',
+                  id: 's3_secret_key',
+                  label: 'Secret Access Key',
+                  layout: 'stacked',
+                  value: config.s3_secret_key,
+                  placeholder: tr('对象存储访问密钥', 'Object storage secret access key'),
+                },
+                supportsFormAutosave,
+              ),
             ],
           },
           {
             kind: 'group',
             visible_when: { control_id: 'provider', equals: 'github' },
             fields: [
-              {
-                kind: 'input',
-                id: 'gh_repo',
-                label: tr('仓库 (owner/repo)', 'Repository (owner/repo)'),
-                layout: 'stacked',
-                value: config.gh_repo,
-                placeholder: tr('例如 username/image-assets', 'e.g. username/image-assets'),
-              },
-              {
-                kind: 'input',
-                id: 'gh_branch',
-                label: tr('目标分支', 'Target branch'),
-                layout: 'stacked',
-                value: config.gh_branch,
-                placeholder: 'main',
-              },
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 'gh_repo',
+                  label: tr('仓库 (owner/repo)', 'Repository (owner/repo)'),
+                  layout: 'stacked',
+                  value: config.gh_repo,
+                  placeholder: tr('例如 username/image-assets', 'e.g. username/image-assets'),
+                },
+                supportsFormAutosave,
+              ),
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 'gh_branch',
+                  label: tr('目标分支', 'Target branch'),
+                  layout: 'stacked',
+                  value: config.gh_branch,
+                  placeholder: 'main',
+                },
+                supportsFormAutosave,
+              ),
             ],
           },
           {
             kind: 'group',
             visible_when: { control_id: 'provider', equals: 'github' },
             fields: [
-              {
-                kind: 'secret',
-                id: 'gh_token',
-                label: 'Personal Access Token',
-                layout: 'stacked',
-                value: config.gh_token,
-                placeholder: tr(
-                  '具备 repo 写入权限的 GitHub Token',
-                  'GitHub token with repository write access',
-                ),
-              },
-              {
-                kind: 'segmented',
-                id: 'gh_cdn',
-                label: tr('外链加速', 'Image URL source'),
-                layout: 'stacked',
-                value: config.gh_cdn,
-                options: [
-                  { value: 'jsdelivr', label: tr('jsDelivr 加速', 'jsDelivr CDN') },
-                  { value: 'raw', label: tr('GitHub 原生', 'GitHub Raw') },
-                ],
-              },
+              withAutosave(
+                {
+                  kind: 'secret',
+                  id: 'gh_token',
+                  label: 'Personal Access Token',
+                  layout: 'stacked',
+                  value: config.gh_token,
+                  placeholder: tr(
+                    '具备 repo 写入权限的 GitHub Token',
+                    'GitHub token with repository write access',
+                  ),
+                },
+                supportsFormAutosave,
+              ),
+              withAutosave(
+                {
+                  kind: 'segmented',
+                  id: 'gh_cdn',
+                  label: tr('外链加速', 'Image URL source'),
+                  layout: 'stacked',
+                  value: config.gh_cdn,
+                  options: [
+                    { value: 'jsdelivr', label: tr('jsDelivr 加速', 'jsDelivr CDN') },
+                    { value: 'raw', label: tr('GitHub 原生', 'GitHub Raw') },
+                  ],
+                },
+                supportsFormAutosave,
+              ),
             ],
           },
           {
             kind: 'group',
             fields: [
-              {
-                kind: 'input',
-                id: 'public_domain',
-                label: tr('公开访问域名', 'Public domain'),
-                layout: 'stacked',
-                value: config.public_domain,
-                placeholder: publicDomainPlaceholder,
-                visible_when: { control_id: 'provider', in: ['r2', 's3'] },
-              },
-              {
-                kind: 'input',
-                id: 'remote_prefix',
-                label: tr('远端目录前缀', 'Remote path prefix'),
-                layout: 'stacked',
-                value: config.remote_prefix,
-                placeholder: tr('例如 notes（可留空）', 'e.g. notes (optional)'),
-              },
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 'public_domain',
+                  label: tr('公开访问域名', 'Public domain'),
+                  layout: 'stacked',
+                  value: config.public_domain,
+                  placeholder: publicDomainPlaceholder,
+                  visible_when: { control_id: 'provider', in: ['r2', 's3'] },
+                },
+                supportsFormAutosave,
+              ),
+              withAutosave(
+                {
+                  kind: 'input',
+                  id: 'remote_prefix',
+                  label: tr('远端目录前缀', 'Remote path prefix'),
+                  layout: 'stacked',
+                  value: config.remote_prefix,
+                  placeholder: tr('例如 notes（可留空）', 'e.g. notes (optional)'),
+                },
+                supportsFormAutosave,
+              ),
             ],
           },
-          {
-            kind: 'segmented',
-            id: 'naming_rule',
-            label: tr('远端命名规则', 'Remote file naming'),
-            value: config.naming_rule,
-            options: [
-              { value: 'ym_hash', label: tr('年月哈希', 'Year/month and hash') },
-              { value: 'note_dir', label: tr('按笔记目录', 'By note directory') },
-              { value: 'original', label: tr('原文件名', 'Original filename') },
-            ],
-          },
-          {
-            kind: 'segmented',
-            id: 'menubar_copy_format',
-            label: tr('菜单栏复制格式', 'Menu bar copy format'),
-            value: config.menubar_copy_format,
-            options: [
-              { value: 'markdown', label: 'Markdown' },
-              { value: 'url', label: 'URL' },
-            ],
-          },
-          {
-            kind: 'switch',
-            id: 'auto_upload',
-            label: tr(
-              '保存笔记时自动上传本地图片（保留本地原图）',
-              'Auto-upload local images when saving a note (keep local originals)',
-            ),
-            value: Boolean(config.auto_upload),
-          },
-          {
-            kind: 'actions',
-            buttons: [
-              {
-                id: 'test_conn',
-                label: tr('测试连接', 'Test connection'),
-                busy_label: tr('测试中...', 'Testing...'),
-                success_label: tr('连接正常', 'Connected'),
-                error_label: tr('连接失败', 'Connection failed'),
-                retry_label: tr('重新测试', 'Test again'),
-                variant: 'secondary',
-              },
-              {
-                id: 'save_config',
-                label: tr('保存配置', 'Save configuration'),
-                busy_label: tr('保存中...', 'Saving...'),
-                success_label: tr('已保存', 'Saved'),
-                error_label: tr('保存失败', 'Save failed'),
-                retry_label: tr('重试保存', 'Retry save'),
-                variant: 'primary',
-              },
-            ],
-          },
+          withAutosave(
+            {
+              kind: 'segmented',
+              id: 'naming_rule',
+              label: tr('远端命名规则', 'Remote file naming'),
+              value: config.naming_rule,
+              options: [
+                { value: 'ym_hash', label: tr('年月哈希', 'Year/month and hash') },
+                { value: 'note_dir', label: tr('按笔记目录', 'By note directory') },
+                { value: 'original', label: tr('原文件名', 'Original filename') },
+              ],
+            },
+            supportsFormAutosave,
+          ),
+          withAutosave(
+            {
+              kind: 'segmented',
+              id: 'menubar_copy_format',
+              label: tr('菜单栏复制格式', 'Menu bar copy format'),
+              value: config.menubar_copy_format,
+              options: [
+                { value: 'markdown', label: 'Markdown' },
+                { value: 'url', label: 'URL' },
+              ],
+            },
+            supportsFormAutosave,
+          ),
+          withAutosave(
+            {
+              kind: 'switch',
+              id: 'auto_upload',
+              label: tr(
+                '保存笔记时自动上传本地图片（保留本地原图）',
+                'Auto-upload local images when saving a note (keep local originals)',
+              ),
+              value: Boolean(config.auto_upload),
+            },
+            supportsFormAutosave,
+          ),
+          ...channelBottomItems,
         ],
       },
     ],
