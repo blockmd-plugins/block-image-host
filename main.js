@@ -422,7 +422,7 @@ function formatUploadException(err) {
 
 function isLocalRegularFile(filePath) {
   try {
-    const st = callHost('host.fs.stat', { path: filePath });
+    const st = callHost('host.fs.stat', { path: filePath, lstat: true });
     return isStatRegularFile(st);
   } catch {
     return false;

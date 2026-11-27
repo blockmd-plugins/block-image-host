@@ -643,7 +643,7 @@ export function resolveLocalFile(nbRoot, notePath, relAssetPath) {
 
   for (const cand of candidates) {
     try {
-      const st = callHost('host.fs.stat', { path: cand });
+      const st = callHost('host.fs.stat', { path: cand, lstat: true });
       if (isStatRegularFile(st)) {
         const realPath =
           (typeof st.real_path === 'string' && st.real_path.trim()) ||

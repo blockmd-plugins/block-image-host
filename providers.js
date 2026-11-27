@@ -606,10 +606,10 @@ export function s3SignedRequest(creds, method, pathSegments, queryParams = null,
   }
 }
 
-export function githubApiRequest(creds, method, apiUrl, payload = undefined) {
+export function githubApiRequest(creds, method, apiUrl, payload = undefined, accept = 'application/vnd.github+json') {
   const headers = {
     Authorization: `Bearer ${creds.token}`,
-    Accept: 'application/vnd.github+json',
+    Accept: accept,
     'User-Agent': 'block-image-host/1.2',
   };
   const req = {
@@ -722,6 +722,8 @@ export function uploadFile(config, creds, nbRoot, notePath, localPath) {
       creds,
       'GET',
       `${apiUrl}?ref=${encodeURIComponent(creds.branch)}`,
+      undefined,
+      'application/vnd.github.object+json',
     );
     if (isPlainObject(info) && info.sha) {
       existingSha = info.sha;
