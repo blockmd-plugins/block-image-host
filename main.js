@@ -768,6 +768,7 @@ function executeUpload(config, stats, logs, notebooks, { targetNote = null, repo
 function saveImmediateConfig(storedCfg, config, incomingValues) {
   const immediateKeys = [
     'selected_notebooks',
+    'provider',
     'auto_upload',
     'naming_rule',
     'gh_cdn',
@@ -954,6 +955,7 @@ function handle(method, params) {
       const { errMsg: credErr } = parseCredentials(config, tr);
       if (credErr) {
         if (isAutosave) {
+          saveImmediateConfig(prevConfig, config, incomingValues);
           if (isDraftIncomplete(config)) {
             return { ok: true, tone: 'info', status: '' };
           }
@@ -976,7 +978,11 @@ function handle(method, params) {
         return { ok: false, tone: 'danger', values: config, page, status: credErr };
       }
 
-      const connChanged = connConfigSignature(prevConfig) !== connConfigSignature(config);
+      const targetSig = connConfigSignature(config);
+      const connChanged =
+        connConfigSignature(prevConfig) !== targetSig ||
+        !prevConnState ||
+        prevConnState.target_sig !== targetSig;
       saveConfig(config);
       let nextLogs = prevLogs;
       let nextConnState = prevConnState;

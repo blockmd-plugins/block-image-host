@@ -521,17 +521,20 @@ export function buildPage({
         collapsible: true,
         default_collapsed: configured && !(supportsFormAutosave && connFailed),
         items: [
-          {
-            kind: 'segmented',
-            id: 'provider',
-            label: tr('图床通道', 'Image host'),
-            value: config.provider,
-            options: [
-              { value: 'r2', label: 'Cloudflare R2' },
-              { value: 's3', label: providerLabel('s3', isEnglish) },
-              { value: 'github', label: providerLabel('github', isEnglish) },
-            ],
-          },
+          withAutosave(
+            {
+              kind: 'segmented',
+              id: 'provider',
+              label: tr('图床通道', 'Image host'),
+              value: config.provider,
+              options: [
+                { value: 'r2', label: 'Cloudflare R2' },
+                { value: 's3', label: providerLabel('s3', isEnglish) },
+                { value: 'github', label: providerLabel('github', isEnglish) },
+              ],
+            },
+            supportsFormAutosave,
+          ),
           {
             kind: 'group',
             visible_when: { control_id: 'provider', in: ['r2', 's3'] },
