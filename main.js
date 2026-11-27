@@ -30,6 +30,7 @@ import {
 import {
   buildPage,
   collectPendingImages,
+  connConfigSignature,
   isConfigReady,
   uploadDedupeKey,
 } from './ui.js';
@@ -49,6 +50,9 @@ const state = {
   supportsAddFolder: false,
   supportsMultiNotebook: false,
   supportsActionProgress: false,
+  supportsProgressBar: false,
+  supportsFormAutosave: false,
+  supportsButtonLink: false,
   supportsToastBanner: false,
   supportsOpenSettings: false,
 };
@@ -69,7 +73,7 @@ function errorDetail(error) {
   return englishDiagnostic(detail) || 'No English error details available.';
 }
 
-function emitProgress(done, total, progress) {
+function emitProgress(done, total, progress, extra = null) {
   if (!state.supportsActionProgress) {
     return;
   }
@@ -82,6 +86,12 @@ function emitProgress(done, total, progress) {
   }
   if (progress !== undefined && progress !== null) {
     params.progress = Number(progress);
+  }
+  if (extra && typeof extra === 'object' && state.supportsProgressBar) {
+    if (extra.channel) params.channel = String(extra.channel);
+    if (extra.label) params.label = String(extra.label);
+    if (extra.tone) params.tone = String(extra.tone);
+    if (typeof extra.running === 'boolean') params.running = extra.running;
   }
   if (Object.keys(params).length === 0) {
     return;
@@ -268,7 +278,8 @@ function loadState() {
       cleanLogs.push(item);
     }
   }
-  return { config, stats: { uploaded_total: uploadedTotal }, logs: cleanLogs };
+  const connState = isPlainObject(data.conn_state) ? data.conn_state : null;
+  return { config, stats: { uploaded_total: uploadedTotal }, logs: cleanLogs, connState };
 }
 
 function saveConfig(config) {
@@ -281,6 +292,10 @@ function saveStats(stats) {
 
 function saveLogs(logs) {
   callHost('host.storage.set', { key: 'logs', value: logs.slice(0, MAX_LOGS) });
+}
+
+function saveConnState(connState) {
+  callHost('host.storage.set', { key: 'conn_state', value: connState });
 }
 
 function loadMenubarRecent() {
@@ -775,7 +790,28 @@ function saveImmediateConfig(storedCfg, config, incomingValues) {
   return accepted;
 }
 
-function renderSettingsPage({ config, logs, selected, noteItems, statusOverride = null }) {
+function isDraftIncomplete(config) {
+  const c = config || {};
+  if (c.provider === 'r2' || c.provider === 's3') {
+    if (!c.s3_endpoint || !c.s3_bucket || !c.s3_access_key || !c.s3_secret_key) {
+      return true;
+    }
+    if (c.provider === 'r2' && !c.public_domain) {
+      return true;
+    }
+    return false;
+  }
+  return !c.gh_repo || !c.gh_token;
+}
+
+function renderSettingsPage({
+  config,
+  logs,
+  selected,
+  noteItems,
+  connState = null,
+  statusOverride = null,
+}) {
   return buildPage({
     config,
     logs,
@@ -783,6 +819,9 @@ function renderSettingsPage({ config, logs, selected, noteItems, statusOverride 
     noteItems,
     knownNotebooks: state.knownNotebooks,
     supportsAddFolder: state.supportsAddFolder,
+    supportsFormAutosave: state.supportsFormAutosave,
+    supportsProgressBar: state.supportsProgressBar,
+    connState,
     homeDir: state.homeDir,
     isEnglish: isEnglish(),
     tr,
@@ -803,6 +842,9 @@ function handle(method, params) {
     state.supportsAddFolder = caps.has('checklist_add_folder');
     state.supportsMultiNotebook = caps.has('multi_notebook');
     state.supportsActionProgress = caps.has('action_progress');
+    state.supportsProgressBar = caps.has('progress_bar');
+    state.supportsFormAutosave = caps.has('form_autosave');
+    state.supportsButtonLink = caps.has('button_link');
     state.supportsToastBanner = caps.has('toast_banner');
     state.supportsOpenSettings = caps.has('open_settings');
 
@@ -831,7 +873,7 @@ function handle(method, params) {
   }
 
   if (method === 'plugin.render') {
-    const { config: storedCfg, logs } = loadState();
+    const { config: storedCfg, logs, connState } = loadState();
     const incomingValues = isPlainObject(params.values) ? params.values : {};
     const config =
       Object.keys(incomingValues).length > 0
@@ -844,13 +886,14 @@ function handle(method, params) {
       errorDetail,
       tr,
     });
-    const page = renderSettingsPage({ config, logs, selected, noteItems });
+    const page = renderSettingsPage({ config, logs, selected, noteItems, connState });
     const accepted = saveImmediateConfig(storedCfg, config, incomingValues);
     return { page, values: accepted };
   }
 
   if (method === 'plugin.action') {
     const actionId = String(params.action_id || '');
+    const isAutosave = String(params.trigger || '') === 'autosave';
     if (actionId === 'open_image_host_settings') {
       if (state.supportsOpenSettings) {
         try {
@@ -863,7 +906,7 @@ function handle(method, params) {
     }
 
     const incomingValues = isPlainObject(params.values) ? params.values : {};
-    const { config: prevConfig, stats: prevStats, logs: prevLogs } = loadState();
+    const { config: prevConfig, stats: prevStats, logs: prevLogs, connState: prevConnState } = loadState();
     const config = normalizeConfig({ ...prevConfig, ...incomingValues }, normNbPath);
     const selected = selectedNotebooks(config);
 
@@ -901,40 +944,100 @@ function handle(method, params) {
         logs: prevLogs,
         selected,
         noteItems,
+        connState: prevConnState,
         statusOverride: status,
       });
       return { ok, tone, values: config, page, status };
     }
 
     if (actionId === 'save_config') {
+      const { errMsg: credErr } = parseCredentials(config, tr);
+      if (credErr) {
+        if (isAutosave) {
+          if (isDraftIncomplete(config)) {
+            return { ok: true, tone: 'info', status: '' };
+          }
+          return { ok: false, tone: 'danger', status: credErr };
+        }
+        const { noteItems } = scanNotebooks(selected, null, {
+          normNbPath,
+          notebookLabel,
+          errorDetail,
+          tr,
+        });
+        const page = renderSettingsPage({
+          config,
+          logs: prevLogs,
+          selected,
+          noteItems,
+          connState: prevConnState,
+          statusOverride: credErr,
+        });
+        return { ok: false, tone: 'danger', values: config, page, status: credErr };
+      }
+
+      const connChanged = connConfigSignature(prevConfig) !== connConfigSignature(config);
+      saveConfig(config);
+      let nextLogs = prevLogs;
+      let nextConnState = prevConnState;
+
+      if (isAutosave && connChanged) {
+        emitProgress(null, null, null, {
+          channel: 'image_host',
+          label: tr('已保存 · 正在检测连接…', 'Saved · Checking connection…'),
+          tone: 'accent',
+          running: true,
+        });
+        const { ok: testOk, message } = testConnection(config, {
+          tr,
+          isEnglish: isEnglish(),
+          errorDetail,
+        });
+        const testTone = testOk ? 'success' : 'danger';
+        nextLogs = appendLog(
+          prevLogs,
+          `连接测试（${PROVIDER_LABELS[config.provider]}）`,
+          testOk ? '成功' : '失败',
+          testTone,
+          message,
+        );
+        saveLogs(nextLogs);
+        nextConnState = {
+          ok: Boolean(testOk),
+          message,
+          target_sig: connConfigSignature(config),
+          time: formatLocalTime(new Date()),
+          locale: isEnglish() ? 'en' : 'zh',
+        };
+        saveConnState(nextConnState);
+      }
+
       const { noteItems } = scanNotebooks(selected, null, {
         normNbPath,
         notebookLabel,
         errorDetail,
         tr,
       });
-      const { errMsg: credErr } = parseCredentials(config, tr);
-      let ok;
-      let tone;
-      let status;
-      if (credErr) {
-        ok = false;
-        tone = 'danger';
-        status = credErr;
-      } else {
-        saveConfig(config);
-        ok = true;
-        tone = 'success';
-        status = tr('已保存配置', 'Configuration saved');
+      if (isAutosave) {
+        const page = renderSettingsPage({
+          config,
+          logs: nextLogs,
+          selected,
+          noteItems,
+          connState: nextConnState,
+        });
+        return { ok: true, tone: 'success', values: config, page, status: '' };
       }
+      const status = tr('已保存配置', 'Configuration saved');
       const page = renderSettingsPage({
         config,
-        logs: prevLogs,
+        logs: nextLogs,
         selected,
         noteItems,
+        connState: nextConnState,
         statusOverride: status,
       });
-      return { ok, tone, values: config, page, status };
+      return { ok: true, tone: 'success', values: config, page, status };
     }
 
     if (actionId === 'test_conn') {
@@ -958,11 +1061,20 @@ function handle(method, params) {
         message,
       );
       saveLogs(logs);
+      const nextConnState = {
+        ok: Boolean(ok),
+        message,
+        target_sig: connConfigSignature(config),
+        time: formatLocalTime(new Date()),
+        locale: isEnglish() ? 'en' : 'zh',
+      };
+      saveConnState(nextConnState);
       const page = renderSettingsPage({
         config,
         logs,
         selected,
         noteItems,
+        connState: nextConnState,
         statusOverride: message,
       });
       return { ok, tone, values: config, page, status: message };
@@ -973,6 +1085,7 @@ function handle(method, params) {
       const { logs, status, uploadedCount, failedCount, credErr } = res;
       let ok;
       let tone;
+      let nextConnState = prevConnState;
       if (selected.length === 0) {
         ok = false;
         tone = 'warning';
@@ -990,6 +1103,16 @@ function handle(method, params) {
         ok = true;
         tone = 'success';
         saveConfig(config);
+        if (prevConnState && prevConnState.ok === false) {
+          nextConnState = {
+            ok: true,
+            message: '',
+            target_sig: connConfigSignature(config),
+            time: formatLocalTime(new Date()),
+            locale: isEnglish() ? 'en' : 'zh',
+          };
+          saveConnState(nextConnState);
+        }
       }
       if (uploadedCount > 0 || failedCount > 0) {
         notifyUploadResult(status, '', tone, failedCount > 0);
@@ -1005,6 +1128,7 @@ function handle(method, params) {
         logs,
         selected,
         noteItems,
+        connState: nextConnState,
         statusOverride: status,
       });
       return { ok, tone, values: config, page, status };
@@ -1026,6 +1150,7 @@ function handle(method, params) {
       logs: prevLogs,
       selected,
       noteItems,
+      connState: prevConnState,
       statusOverride: status,
     });
     return { ok: false, tone: 'warning', values: config, page, status };
