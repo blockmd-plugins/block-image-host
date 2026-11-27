@@ -341,22 +341,42 @@ jobs:
                   }
                   if (method === 'host.fs.stat') {
                     try {
-                      const st = fs.statSync(params.path);
+                      const st = fs.lstatSync(params.path);
+                      const isSymlink = st.isSymbolicLink();
+                      const isDir = st.isDirectory() && !isSymlink;
+                      const isRegular = st.isFile() && !isSymlink;
                       return {
                         exists: true,
-                        is_file: st.isFile(),
-                        is_dir: st.isDirectory(),
+                        path: params.path,
+                        name: path.basename(params.path),
+                        is_dir: isDir,
+                        is_regular: isRegular,
+                        is_symlink: isSymlink,
                         size: st.size,
-                        mtime_ms: st.mtimeMs,
-                        birthtime_ms: st.birthtimeMs || st.mtimeMs,
+                        mod_time: new Date(st.mtimeMs).toISOString(),
+                        mod_time_ms: Math.round(st.mtimeMs),
+                        is_icloud_placeholder: false,
                       };
                     } catch {
-                      return { exists: false, is_file: false };
+                      return { exists: false };
                     }
                   }
                   if (method === 'host.fs.read') {
                     const buf = fs.readFileSync(params.path);
-                    return { content: buf.toString(params.encoding === 'base64' ? 'base64' : 'utf8'), bytes: buf.length };
+                    if (params.encoding === 'base64') {
+                      return {
+                        path: params.path,
+                        encoding: 'base64',
+                        content_base64: buf.toString('base64'),
+                        size: buf.length,
+                      };
+                    }
+                    return {
+                      path: params.path,
+                      encoding: 'utf8',
+                      content: buf.toString('utf8'),
+                      size: buf.length,
+                    };
                   }
                   if (method === 'host.crypto.hash') {
                     const h = crypto.createHash(params.algorithm);
@@ -377,7 +397,7 @@ jobs:
                     return { hex: dig.toString('hex'), base64: dig.toString('base64') };
                   }
                   if (method === 'host.http.request') {
-                    state.httpCalls.push({ method: params.method, url: params.url });
+                    state.httpCalls.push({ method: params.method, url: params.url, body: params.body || '' });
                     if (String(params.url).includes('api.github.com')) {
                       if (params.method === 'GET' && String(params.url).includes('/contents/')) {
                         return { status: 404, headers: {}, body: '{"message":"Not Found"}', bytes: 23, final_url: params.url };
@@ -497,6 +517,38 @@ jobs:
                 path: 'second.md',
               });
               requireCond(evRes?.handled === true, `${locale}: note.saved failed`);
+
+              const uploadRes = rpc('plugin.action', {
+                action_id: 'upload_now',
+                values: { ...valid, provider: 'r2', selected_notebooks: [nbA] },
+              });
+              requireCond(uploadRes?.ok === true, `${locale}: upload_now failed`);
+              checkText(uploadRes, locale, `${locale} upload_now`);
+              requireCond(
+                String(sdk.state.notes['first.md'] || '').includes('https://images.example.com/'),
+                `${locale}: upload_now did not rewrite note link`,
+              );
+
+              const ghSaveRes = rpc('plugin.action', {
+                action_id: 'save_config',
+                values: { ...valid, provider: 'github', gh_branch: 'feat/img', selected_notebooks: [nbA] },
+              });
+              requireCond(ghSaveRes?.ok === true, `${locale}: github save_config failed`);
+              const ghCmdRes = rpc('plugin.command', {
+                command_id: 'upload-dropped',
+                context: { source: 'menubar_drop', files: [dropImg] },
+              });
+              requireCond(
+                ghCmdRes?.ok === true && String(ghCmdRes.copy_text || '').includes('/feat/img/'),
+                `${locale}: github upload-dropped failed`,
+              );
+              const ghPut = [...sdk.state.httpCalls].reverse().find(
+                (c) => c.method === 'PUT' && String(c.url).includes('api.github.com'),
+              );
+              requireCond(
+                ghPut && JSON.parse(ghPut.body || '{}').content === Buffer.from('drop-fixture').toString('base64'),
+                `${locale}: github PUT content did not match base64 payload`,
+              );
 
               const shut = rpc('plugin.shutdown');
               requireCond(shut?.ok === true, `${locale}: shutdown failed`);
