@@ -2,7 +2,7 @@ name: Daily Release
 
 on:
   schedule:
-    # 每天 00:00 UTC（北京时间 08:00）自动检查；有新插件代码提交且当日未发版时自动递增版本号发版（08:15 由 store-index 自动采集）。
+    # 每天 00:00 UTC（北京时间 08:00）自动检查；有新的打包内容且当日未发版时自动递增版本号发版（08:15 由 store-index 自动采集）。
     - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
@@ -42,531 +42,708 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           FORCE: ${{ inputs.force == true && 'true' || 'false' }}
         run: |
-          python3 - <<'PY'
-          import concurrent.futures
-          import datetime
-          import itertools
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import select
-          import shutil
-          import subprocess
-          import sys
-          import tempfile
+          node --input-type=module - <<'NODE'
+          import { execFileSync, spawnSync } from 'node:child_process';
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
 
-          HAN = re.compile(
-              r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
-          )
-          CJK = re.compile(
-              r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-              r"\ufe10-\ufe1f\ufe30-\ufe4f\uff00-\uffef"
-              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
-          )
-          EMOJI = re.compile(
-              r"[©®‼⁉™ℹ↔-↙↩↪⌚-⌛⌨⏏⏩-⏳⏸-⏺Ⓜ▪▫▶◀◻-◾"
-              r"\u2600-\u27bf⤴⤵⬅-⬇⬛⬜⭐⭕〰〽㊗㊙"
-              r"\u20e3\ufe00-\ufe0f\U0001f000-\U0001faff]"
-          )
-          MAX_README_BYTES = 512 * 1024
+          const CHINESE = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\ufe10-\ufe1f\ufe30-\ufe4f\uff00-\uffef\u{20000}-\u{2ffff}\u{30000}-\u{323af}]/u;
+          const HAN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u{20000}-\u{2ffff}\u{30000}-\u{323af}]/u;
+          const EMOJI = /[©®‼⁉™ℹ↔-↙↩↪⌚-⌛⌨⏏⏩-⏳⏸-⏺Ⓜ▪▫▶◀◻-◾\u2600-\u27bf⤴⤵⬅-⬇⬛⬜⭐⭕〰〽㊗㊙\u20e3\ufe00-\ufe0f\u{1f000}-\u{1faff}]/u;
+          const MAX_README_BYTES = 512 * 1024;
 
-          def require(condition, message):
-              if not condition:
-                  raise ValueError(message)
+          function requireCond(condition, message) {
+            if (!condition) {
+              throw new Error(message);
+            }
+          }
 
-          def check_no_symlinks_tree(pkg_dir):
-              require(not os.path.islink(pkg_dir) and pkg_dir.is_dir(), f"Release package dir must be a non-symlink directory: {pkg_dir}")
-              for root_dir, dir_names, file_names in os.walk(pkg_dir, followlinks=False):
-                  for name in dir_names + file_names:
-                      full_path = os.path.join(root_dir, name)
-                      require(
-                          not os.path.islink(full_path),
-                          f"Symlink is not allowed in release package: {os.path.relpath(full_path, pkg_dir)}",
-                      )
+          function sh(cmd, args, opts = {}) {
+            return execFileSync(cmd, args, { encoding: 'utf8', ...opts }).trim();
+          }
 
-          def strip_html_comments(text):
-              text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
-              text = re.sub(r"<!--.*$", "", text, flags=re.S)
-              return text.strip()
+          function succeeds(cmd, args) {
+            return spawnSync(cmd, args, { stdio: 'ignore' }).status === 0;
+          }
 
-          def read_strict_readme(pkg_dir, filename):
-              path = pkg_dir / filename
-              p = str(path)
-              require(not os.path.islink(p) and os.path.isfile(p), f"{filename} must be a non-symlink regular file")
-              raw = path.read_bytes()
-              require(len(raw) <= MAX_README_BYTES, f"{filename} exceeds {MAX_README_BYTES} bytes")
-              try:
-                  text = raw.decode("utf-8")
-              except UnicodeDecodeError as exc:
-                  raise ValueError(f"{filename} must be valid UTF-8: {exc}") from None
-              text = text.lstrip("\ufeff").strip()
-              require(bool(text), f"{filename} must not be empty")
-              return text
+          function summary(msg) {
+            console.log(msg);
+            const sPath = process.env.GITHUB_STEP_SUMMARY;
+            if (sPath) {
+              fs.appendFileSync(sPath, `${msg}\n`, 'utf8');
+            }
+          }
 
-          def resolve_entry_command(pkg_dir, manifest):
-              entry = manifest.get("entry")
-              require(isinstance(entry, dict), "manifest.entry must be an object")
-              raw_cmd = entry.get("command")
-              require(isinstance(raw_cmd, list) and len(raw_cmd) > 0, "manifest.entry.command must be a non-empty array")
-              for idx, part in enumerate(raw_cmd):
-                  require(isinstance(part, str), f"manifest.entry.command[{idx}] must be a string")
-              cmd0 = raw_cmd[0]
-              require(cmd0.strip() != "", "manifest.entry.command[0] must not be empty")
-              require(cmd0 == cmd0.strip(), "manifest.entry.command[0] must not have leading/trailing whitespace")
-              require("\x00" not in cmd0 and ":" not in cmd0, f"Invalid entry.command[0]: {cmd0!r}")
+          function setOutput(outputs) {
+            const oPath = process.env.GITHUB_OUTPUT;
+            if (oPath) {
+              const lines = Object.entries(outputs).map(([k, v]) => `${k}=${v}\n`).join('');
+              fs.appendFileSync(oPath, lines, 'utf8');
+            }
+          }
 
-              normalized = cmd0.replace("\\", "/")
-              require(not normalized.startswith("/") and not os.path.isabs(cmd0), f"entry.command[0] must not be an absolute path: {cmd0!r}")
-              raw_parts = [p for p in normalized.split("/") if p != ""]
-              require(".." not in raw_parts, f"entry.command[0] must not contain '..': {cmd0!r}")
-              require(normalized not in (".", "./") and raw_parts != ["."], f"entry.command[0] must not be '.': {cmd0!r}")
+          function checkText(value, locale, context) {
+            if (typeof value === 'string') {
+              requireCond(!EMOJI.test(value), `${context}: emoji in ${JSON.stringify(value)}`);
+              if (locale.toLowerCase().startsWith('en')) {
+                requireCond(!CHINESE.test(value), `${context}: Chinese text in ${JSON.stringify(value)}`);
+              }
+            } else if (Array.isArray(value)) {
+              value.forEach((child, index) => checkText(child, locale, `${context}[${index}]`));
+            } else if (value && typeof value === 'object') {
+              for (const [key, child] of Object.entries(value)) {
+                checkText(key, 'zh', `${context}.<key>`);
+                checkText(child, locale, `${context}.${key}`);
+              }
+            }
+          }
 
-              if "/" in normalized or normalized.startswith("."):
-                  pkg_root = pkg_dir.resolve()
-                  rel_parts = [p for p in raw_parts if p != "."]
-                  require(bool(rel_parts), f"Invalid relative entry.command[0]: {cmd0!r}")
-                  cur = pkg_dir
-                  for part in rel_parts[:-1]:
-                      cur = cur / part
-                      require(not os.path.islink(cur) and cur.is_dir(), f"entry.command[0] parent missing or symlink: {cmd0!r}")
-                  target = cur / rel_parts[-1]
-                  require(not os.path.islink(target) and target.is_file(), f"entry.command[0] must be a non-symlink regular file in dist package: {cmd0!r}")
-                  resolved = target.resolve()
-                  require(resolved.is_relative_to(pkg_root) and resolved != pkg_root, f"entry.command[0] escapes dist package: {cmd0!r}")
-                  resolved_cmd0 = str(resolved)
-              else:
-                  found = shutil.which(cmd0)
-                  require(found is not None, f"entry.command[0] is not a valid PATH command: {cmd0!r}")
-                  resolved_cmd0 = found
+          function checkContributesEn(value, context = 'manifest.contributes') {
+            if (Array.isArray(value)) {
+              value.forEach((child, index) => checkContributesEn(child, `${context}[${index}]`));
+            } else if (value && typeof value === 'object') {
+              for (const [key, child] of Object.entries(value)) {
+                if (key === 'en') {
+                  checkText(child, 'en', `${context}.en`);
+                } else {
+                  checkContributesEn(child, `${context}.${key}`);
+                }
+              }
+            }
+          }
 
-              return [resolved_cmd0, *raw_cmd[1:]]
+          function declaredSurfaces(manifest) {
+            const surfaces = [...(manifest.surfaces || [])];
+            const contributes = manifest.contributes || {};
+            for (const sec of contributes.settings_sections || []) {
+              surfaces.push(`settings_section:${sec.id}`);
+            }
+            for (const panel of contributes.panels || []) {
+              surfaces.push(`panel:${panel.id}`);
+            }
+            for (const dialog of contributes.dialogs || []) {
+              surfaces.push(`dialog:${dialog.id}`);
+            }
+            requireCond(surfaces.length > 0, 'manifest must declare at least one surface');
+            return [...new Set(surfaces)];
+          }
 
-          def declared_surfaces(manifest):
-              surfaces = list(manifest.get("surfaces") or [])
-              contributes = manifest.get("contributes") or {}
-              for sec in contributes.get("settings_sections") or []:
-                  surfaces.append(f"settings_section:{sec['id']}")
-              for panel in contributes.get("panels") or []:
-                  surfaces.append(f"panel:{panel['id']}")
-              for dialog in contributes.get("dialogs") or []:
-                  surfaces.append(f"dialog:{dialog['id']}")
-              require(surfaces, "manifest must declare at least one surface")
-              return list(dict.fromkeys(surfaces))
+          function checkNoSymlinksTree(pkgDir) {
+            const rootStat = fs.lstatSync(pkgDir);
+            requireCond(!rootStat.isSymbolicLink() && rootStat.isDirectory(), `Release package dir must be a non-symlink directory: ${pkgDir}`);
+            const walk = (dir) => {
+              for (const entry of fs.readdirSync(dir)) {
+                const fullPath = path.join(dir, entry);
+                const st = fs.lstatSync(fullPath);
+                requireCond(!st.isSymbolicLink(), `Symlink is not allowed in release package: ${path.relative(pkgDir, fullPath)}`);
+                if (st.isDirectory()) {
+                  walk(fullPath);
+                }
+              }
+            };
+            walk(pkgDir);
+          }
 
-          def check_contributes_en(value, context="manifest.contributes"):
-              if isinstance(value, dict):
-                  for key, item in value.items():
-                      if key == "en":
-                          check_ui(item, "en", f"{context}.en")
-                      else:
-                          check_contributes_en(item, f"{context}.{key}")
-              elif isinstance(value, list):
-                  for i, item in enumerate(value):
-                      check_contributes_en(item, f"{context}[{i}]")
+          function stripHtmlComments(text) {
+            return text.replace(/<!--[\s\S]*?-->/g, '').replace(/<!--[\s\S]*$/, '').trim();
+          }
 
-          class SandboxHost:
-              def __init__(self, process, root):
-                  self.process = process
-                  self.notebooks = (root / "Notebook A", root / "Notebook B")
-                  self.storage = {}
-                  self.notes = {
-                      "first.md": " ".join(f"![Photo](photo-{i}.png)" for i in range(8)),
-                      "second.md": "![Shared photo](photo-0.png)",
+          function readStrictReadme(pkgDir, filename) {
+            const filePath = path.join(pkgDir, filename);
+            const st = fs.lstatSync(filePath, { throwIfNoEntry: false });
+            requireCond(st && !st.isSymbolicLink() && st.isFile(), `${filename} must be a non-symlink regular file`);
+            const raw = fs.readFileSync(filePath);
+            requireCond(raw.length <= MAX_README_BYTES, `${filename} exceeds ${MAX_README_BYTES} bytes`);
+            let text;
+            try {
+              text = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+            } catch (err) {
+              throw new Error(`${filename} must be valid UTF-8: ${err.message}`);
+            }
+            text = text.replace(/^\ufeff/, '').trim();
+            requireCond(Boolean(text), `${filename} must not be empty`);
+            return text;
+          }
+
+          function resolveEntryJS(pkgDir, manifest) {
+            const entry = manifest.entry;
+            requireCond(entry && typeof entry === 'object' && !Array.isArray(entry), 'manifest.entry must be an object');
+            const jsRel = entry.js;
+            requireCond(typeof jsRel === 'string' && jsRel.length > 0 && jsRel === jsRel.trim(), 'manifest.entry.js must be a non-empty relative path');
+            requireCond(!jsRel.startsWith('/') && !jsRel.includes('\\') && !jsRel.includes(':'), `Invalid manifest.entry.js: ${JSON.stringify(jsRel)}`);
+            const parts = jsRel.split('/');
+            requireCond(!parts.includes('..') && !parts.includes('.') && parts.every((p) => p.length > 0), `manifest.entry.js must be a clean relative path: ${JSON.stringify(jsRel)}`);
+            requireCond(jsRel.endsWith('.js') || jsRel.endsWith('.mjs'), `manifest.entry.js must end with .js or .mjs: ${JSON.stringify(jsRel)}`);
+            const target = path.join(pkgDir, ...parts);
+            const st = fs.lstatSync(target, { throwIfNoEntry: false });
+            requireCond(st && !st.isSymbolicLink() && st.isFile(), `manifest.entry.js must be a non-symlink regular file: ${jsRel}`);
+            return target;
+          }
+
+          function checkJsSyntax(pkgDir) {
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'block-js-syntax-'));
+            try {
+              let idx = 0;
+              const walk = (dir) => {
+                for (const name of fs.readdirSync(dir).sort()) {
+                  const fullPath = path.join(dir, name);
+                  const st = fs.lstatSync(fullPath);
+                  if (st.isDirectory()) {
+                    walk(fullPath);
+                  } else if (st.isFile()) {
+                    requireCond(!name.endsWith('.py'), `Unexpected Python file in JS plugin package: ${path.relative(pkgDir, fullPath)}`);
+                    if (name.endsWith('.js') || name.endsWith('.mjs')) {
+                      idx += 1;
+                      const checkPath = path.join(tmpDir, `check-${idx}.mjs`);
+                      fs.copyFileSync(fullPath, checkPath);
+                      execFileSync(process.execPath, ['--check', checkPath], { stdio: 'pipe' });
+                    }
                   }
-                  for notebook in self.notebooks:
-                      notebook.mkdir()
-                      for i in range(8):
-                          (notebook / f"photo-{i}.png").write_bytes(b"fixture")
-                  self.request_id = 0
+                }
+              };
+              walk(pkgDir);
+            } finally {
+              fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+          }
 
-              def host_result(self, method, params):
-                  if method == "host.notebooks.list":
-                      return {"notebooks": [
-                          {"path": str(path), "name": path.name, "active": i == 0}
-                          for i, path in enumerate(self.notebooks)
-                      ]}
-                  if method == "host.storage.get":
-                      return {"data": self.storage}
-                  if method == "host.storage.set":
-                      self.storage[params["key"]] = params["value"]
-                      return {"ok": True}
-                  if method == "host.notes.list":
-                      return {"notes": [{"path": path} for path in self.notes]}
-                  if method == "host.notes.read":
-                      return {"content": self.notes[params["path"]], "revision": "fixture-1"}
-                  if method == "host.notes.write":
-                      self.notes[params["path"]] = params["content"]
-                      return {"ok": True}
-                  if method == "host.ui.toast":
-                      return {"ok": True, "shown": True}
-                  if method == "host.ui.open_settings":
-                      return {"ok": True}
-                  raise ValueError(f"Unexpected host request: {method}")
+          function collectControls(page) {
+            const map = new Map();
+            const walk = (items) => {
+              for (const item of items || []) {
+                if (item.kind === 'group') {
+                  walk(item.fields);
+                } else if (item.id) {
+                  map.set(item.id, item);
+                }
+              }
+            };
+            for (const card of page.cards || []) {
+              walk(card.items);
+            }
+            return map;
+          }
 
-              def send(self, message):
-                  self.process.stdin.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
-                  self.process.stdin.flush()
+          function cartesian(lists) {
+            return lists.reduce(
+              (acc, cur) => acc.flatMap((prev) => cur.map((val) => [...prev, val])),
+              [[]],
+            );
+          }
 
-              def call(self, method, params=None):
-                  self.request_id += 1
-                  self.send({"id": self.request_id, "method": method, "params": params or {}})
-                  for _ in range(100):
-                      ready, _, _ = select.select([self.process.stdout], [], [], 5)
-                      require(ready, f"Plugin timed out during {method}")
-                      line = self.process.stdout.readline()
-                      require(line, f"Plugin exited during {method}")
-                      response = json.loads(line)
-                      require(response.get("jsonrpc") == "2.0", f"Invalid JSON-RPC message during {method}")
-                      if "method" in response:
-                          result = self.host_result(response["method"], response.get("params", {}))
-                          self.send({"id": response["id"], "result": result})
-                          continue
-                      require(response.get("id") == self.request_id, f"Unexpected response ID during {method}")
-                      require("result" in response and "error" not in response, f"{method} failed: {response}")
-                      return response["result"]
-                  raise ValueError(f"Too many host calls during {method}")
+          async function runJsSmokeLocale(pkgDir, entryRel, locale, pluginId, surfaces) {
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `block-image-host-${locale}-`));
+            const pluginSandbox = path.join(tmpDir, 'plugin');
+            fs.mkdirSync(pluginSandbox, { recursive: true });
+            const nbA = path.join(tmpDir, 'Notebook A');
+            const nbB = path.join(tmpDir, 'Notebook B');
+            const notebooks = [nbA, nbB];
+            for (const nb of notebooks) {
+              fs.mkdirSync(nb, { recursive: true });
+              for (let i = 0; i < 8; i += 1) {
+                fs.writeFileSync(path.join(nb, `photo-${i}.png`), 'fixture');
+              }
+            }
+            const dropImg = path.join(tmpDir, 'drop.png');
+            fs.writeFileSync(dropImg, 'drop-fixture');
 
-          def check_ui(value, locale, context):
-              if isinstance(value, str):
-                  require(not EMOJI.search(value), f"{locale} {context}: Emoji in {value!r}")
-                  if locale == "en":
-                      require(not CJK.search(value), f"{context}: Chinese text or punctuation in {value!r}")
-              elif isinstance(value, dict):
-                  for key, item in value.items():
-                      check_ui(item, locale, f"{context}.{key}")
-              elif isinstance(value, list):
-                  for i, item in enumerate(value):
-                      check_ui(item, locale, f"{context}[{i}]")
+            try {
+              const copyTree = (srcDir, dstDir) => {
+                for (const name of fs.readdirSync(srcDir)) {
+                  const src = path.join(srcDir, name);
+                  const dst = path.join(dstDir, name);
+                  const st = fs.lstatSync(src);
+                  if (st.isDirectory()) {
+                    fs.mkdirSync(dst, { recursive: true });
+                    copyTree(src, dst);
+                  } else if (st.isFile() && (name.endsWith('.js') || name.endsWith('.mjs'))) {
+                    const raw = fs.readFileSync(src, 'utf8');
+                    const rewritten = raw.replace(/(['"])\/runtime\/block-sdk\.js\1/g, "'./block-sdk.mjs'");
+                    fs.writeFileSync(dst, rewritten, 'utf8');
+                  }
+                }
+              };
+              copyTree(pkgDir, pluginSandbox);
+              fs.writeFileSync(path.join(pluginSandbox, 'package.json'), '{"type":"module"}\n', 'utf8');
 
-          def controls(page):
-              def walk(items):
-                  for item in items:
-                      if item["kind"] == "group":
-                          yield from walk(item["fields"])
-                      else:
-                          yield item
+              const entrySource = fs.readFileSync(path.join(pkgDir, entryRel), 'utf8');
+              requireCond(
+                entrySource.includes("'/runtime/block-sdk.js'") || entrySource.includes('"/runtime/block-sdk.js"'),
+                'entry.js must import /runtime/block-sdk.js',
+              );
 
-              return {
-                  item["id"]: item
-                  for card in page["cards"]
-                  for item in walk(card["items"])
-                  if "id" in item
+              const sdkMock = `
+                import crypto from 'node:crypto';
+                import fs from 'node:fs';
+                import path from 'node:path';
+
+                export const state = {
+                  notebooks: ${JSON.stringify(notebooks)},
+                  storage: {
+                    logs: [{
+                      title: '连接测试（S3 兼容）',
+                      status: '未连通',
+                      time: '12:00',
+                      tooltip: '图床服务端返回 HTTP 403，请核对凭证、区域或存储桶权限',
+                    }],
+                  },
+                  notes: {
+                    'first.md': ${JSON.stringify(Array.from({ length: 8 }, (_, i) => `![Photo](photo-${i}.png)`).join(' '))},
+                    'second.md': '![Shared photo](photo-0.png)',
+                  },
+                  httpCalls: [],
+                  progress: [],
+                  toasts: [],
+                  menubar: null,
+                  handler: null,
+                };
+                export function serve(handler) {
+                  state.handler = handler;
+                }
+                export function notifyHost(method, params = {}) {
+                  if (method === 'host.action.progress') {
+                    state.progress.push(params);
+                  }
+                }
+                export function callHost(method, params = {}) {
+                  if (method === 'host.notebooks.list') {
+                    return {
+                      notebooks: state.notebooks.map((p, i) => ({
+                        path: p,
+                        name: path.basename(p),
+                        active: i === 0,
+                      })),
+                    };
+                  }
+                  if (method === 'host.storage.get') {
+                    if (params.key) {
+                      const has = Object.prototype.hasOwnProperty.call(state.storage, params.key);
+                      return { found: has, value: has ? state.storage[params.key] : null };
+                    }
+                    return { data: state.storage };
+                  }
+                  if (method === 'host.storage.set') {
+                    state.storage[params.key] = params.value;
+                    return { ok: true };
+                  }
+                  if (method === 'host.notes.list') {
+                    return { notes: Object.keys(state.notes).map((p) => ({ path: p })) };
+                  }
+                  if (method === 'host.notes.read') {
+                    return { content: state.notes[params.path], revision: 'fixture-1' };
+                  }
+                  if (method === 'host.notes.write') {
+                    state.notes[params.path] = params.content;
+                    return { ok: true };
+                  }
+                  if (method === 'host.fs.stat') {
+                    try {
+                      const st = fs.statSync(params.path);
+                      return {
+                        exists: true,
+                        is_file: st.isFile(),
+                        is_dir: st.isDirectory(),
+                        size: st.size,
+                        mtime_ms: st.mtimeMs,
+                        birthtime_ms: st.birthtimeMs || st.mtimeMs,
+                      };
+                    } catch {
+                      return { exists: false, is_file: false };
+                    }
+                  }
+                  if (method === 'host.fs.read') {
+                    const buf = fs.readFileSync(params.path);
+                    return { content: buf.toString(params.encoding === 'base64' ? 'base64' : 'utf8'), bytes: buf.length };
+                  }
+                  if (method === 'host.crypto.hash') {
+                    const h = crypto.createHash(params.algorithm);
+                    if (params.file_path) h.update(fs.readFileSync(params.file_path));
+                    else if (params.base64 !== undefined) h.update(Buffer.from(params.base64, 'base64'));
+                    else h.update(Buffer.from(params.text ?? '', 'utf8'));
+                    const dig = h.digest();
+                    return { hex: dig.toString('hex'), base64: dig.toString('base64') };
+                  }
+                  if (method === 'host.crypto.hmac') {
+                    const key = params.key_base64 !== undefined
+                      ? Buffer.from(params.key_base64, 'base64')
+                      : Buffer.from(params.key_text ?? '', 'utf8');
+                    const data = params.data_base64 !== undefined
+                      ? Buffer.from(params.data_base64, 'base64')
+                      : Buffer.from(params.data_text ?? '', 'utf8');
+                    const dig = crypto.createHmac(params.algorithm, key).update(data).digest();
+                    return { hex: dig.toString('hex'), base64: dig.toString('base64') };
+                  }
+                  if (method === 'host.http.request') {
+                    state.httpCalls.push({ method: params.method, url: params.url });
+                    if (String(params.url).includes('api.github.com')) {
+                      if (params.method === 'GET' && String(params.url).includes('/contents/')) {
+                        return { status: 404, headers: {}, body: '{"message":"Not Found"}', bytes: 23, final_url: params.url };
+                      }
+                      return { status: 200, headers: {}, body: '{"permissions":{"push":true},"size":1,"default_branch":"main"}', bytes: 60, final_url: params.url };
+                    }
+                    return { status: 200, headers: {}, body: '', bytes: 0, final_url: params.url };
+                  }
+                  if (method === 'host.ui.toast') {
+                    state.toasts.push(params);
+                    return { ok: true, shown: true };
+                  }
+                  if (method === 'host.ui.open_settings') {
+                    return { ok: true };
+                  }
+                  if (method === 'host.menubar.set') {
+                    state.menubar = params;
+                    return { ok: true };
+                  }
+                  throw new Error('Unexpected host request: ' + method);
+                }
+              `;
+              fs.writeFileSync(path.join(pluginSandbox, 'block-sdk.mjs'), sdkMock, 'utf8');
+
+              const sdk = await import(pathToFileURL(path.join(pluginSandbox, 'block-sdk.mjs')).href);
+              await import(pathToFileURL(path.join(pluginSandbox, entryRel)).href);
+              const handler = sdk.state.handler;
+              requireCond(typeof handler === 'function', `${locale}: serve(handler) was not called`);
+
+              const rpc = (method, params = {}) => handler(method, params);
+              const init = rpc('plugin.initialize', {
+                plugin_id: pluginId,
+                locale,
+                data_dir: path.join(tmpDir, 'Data'),
+                downloads_dir: path.join(tmpDir, 'Downloads'),
+                notebook_root: nbA,
+                notebooks,
+                ui_capabilities: ['checklist', 'multi_notebook', 'action_progress', 'toast_banner', 'open_settings'],
+              });
+              requireCond(init?.ready === true, `${locale}: plugin not ready`);
+
+              const valid = {
+                s3_endpoint: 'https://storage.example.com',
+                s3_bucket: 'images',
+                s3_access_key: 'fixture',
+                s3_secret_key: 'fixture',
+                public_domain: 'https://images.example.com',
+                gh_repo: 'example/images',
+                gh_token: 'fixture',
+              };
+
+              const pages = {};
+              for (const surface of surfaces) {
+                const initial = rpc('plugin.render', { surface, values: {} }).page;
+                requireCond(typeof initial?.title === 'string' && initial.title.trim().length > 0, `${locale} ${surface}: missing page title`);
+                checkText(initial, locale, `${locale} ${surface}`);
+                pages[surface] = initial;
+
+                const choices = {};
+                for (const [controlId, item] of collectControls(initial).entries()) {
+                  if (item.kind === 'segmented' || item.kind === 'select') {
+                    choices[controlId] = item.options.map((o) => o.value);
+                  } else if (item.kind === 'switch') {
+                    choices[controlId] = [false, true];
+                  }
+                }
+                const keys = Object.keys(choices);
+                if (surface === 'settings_page') {
+                  requireCond(keys.length > 0 && keys.every((k) => choices[k].length > 0), `${locale}: missing choice controls`);
+                }
+                let count = 0;
+                if (keys.length > 0) {
+                  for (const combo of cartesian(keys.map((k) => choices[k]))) {
+                    const values = Object.fromEntries(keys.map((k, idx) => [k, combo[idx]]));
+                    for (const scenario of [
+                      { selected_notebooks: [] },
+                      { selected_notebooks: notebooks },
+                      { ...valid, selected_notebooks: notebooks },
+                    ]) {
+                      const page = rpc('plugin.render', { surface, values: { ...scenario, ...values } }).page;
+                      checkText(page, locale, `${locale} ${surface} combo`);
+                      const items = collectControls(page);
+                      for (const [controlId, expected] of Object.entries(values)) {
+                        requireCond(items.get(controlId)?.value === expected, `${locale} ${surface}: ${controlId} mismatch`);
+                      }
+                      count += 1;
+                    }
+                  }
+                }
+                console.log(`${locale} ${surface}: ${count + 1} renders passed`);
               }
 
-          def exercise(command, pkg_dir, locale, surfaces):
-              with tempfile.TemporaryDirectory(prefix="image-host-i18n-") as temp:
-                  root = Path(temp)
-                  data_dir = root / "data"
-                  data_dir.mkdir()
-                  env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC") if k in os.environ}
-                  env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"})
-                  with subprocess.Popen(command, cwd=pkg_dir, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
-                      try:
-                          host = SandboxHost(process, root)
-                          paths = list(map(str, host.notebooks))
-                          ready = host.call("plugin.initialize", {
-                              "locale": locale, "data_dir": str(data_dir),
-                              "notebook_root": paths[0], "notebooks": paths,
-                              "ui_capabilities": ["checklist", "multi_notebook"],
-                          })
-                          require(ready.get("ready") is True, f"{locale}: initialization failed")
+              const saveRes = rpc('plugin.action', {
+                action_id: 'save_config',
+                values: { ...valid, provider: 'r2', selected_notebooks: [nbA] },
+              });
+              requireCond(saveRes?.ok === true, `${locale}: save_config failed`);
+              checkText(saveRes, locale, `${locale} save_config`);
 
-                          def render(surface, values):
-                              page = host.call("plugin.render", {"surface": surface, "values": values})["page"]
-                              check_ui(page, locale, f"{surface} render {values}")
-                              return page
+              const testRes = rpc('plugin.action', {
+                action_id: 'test_conn',
+                values: { ...valid, provider: 'r2', selected_notebooks: [nbA] },
+              });
+              requireCond(testRes?.ok === true, `${locale}: test_conn failed`);
+              checkText(testRes, locale, `${locale} test_conn`);
 
-                          valid = {
-                              "s3_endpoint": "https://storage.example.com", "s3_bucket": "images",
-                              "s3_access_key": "fixture", "s3_secret_key": "fixture",
-                              "public_domain": "https://images.example.com",
-                              "gh_repo": "example/images", "gh_token": "fixture",
-                          }
-                          host.storage["logs"] = [{
-                              "title": "连接测试（S3 兼容）", "status": "未连通", "time": "12:00",
-                              "tooltip": "图床服务端返回 HTTP 403，请核对凭证、区域或存储桶权限",
-                          }]
-                          pages_by_surface = {}
-                          for surface in surfaces:
-                              initial = render(surface, {})
-                              require(isinstance(initial.get("title"), str) and initial["title"].strip(),
-                                      f"{locale} {surface}: missing page title")
-                              pages_by_surface[surface] = initial
-                              choices = {}
-                              for control_id, item in controls(initial).items():
-                                  if item["kind"] in {"segmented", "select"}:
-                                      choices[control_id] = [option["value"] for option in item["options"]]
-                                  elif item["kind"] == "switch":
-                                      choices[control_id] = [False, True]
-                              if surface == "settings_page":
-                                  require(choices and all(choices.values()), f"{locale}: missing choice controls or options")
-                              count = 0
-                              if choices:
-                                  for combo in itertools.product(*choices.values()):
-                                      values = dict(zip(choices, combo))
-                                      for scenario in (
-                                          {"selected_notebooks": []},
-                                          {"selected_notebooks": paths},
-                                          {**valid, "selected_notebooks": paths},
-                                      ):
-                                          page = render(surface, {**scenario, **values})
-                                          items = controls(page)
-                                          for control_id, expected in values.items():
-                                              require(items[control_id]["value"] == expected,
-                                                      f"{locale} {surface}: {control_id} did not render {expected!r}")
-                                          count += 1
-                              print(f"{locale} {surface}: {count + 1} renders passed")
-                          require(host.call("plugin.shutdown").get("ok") is True, f"{locale}: shutdown failed")
-                          require(process.wait(timeout=5) == 0, f"{locale}: plugin did not exit cleanly")
-                          return pages_by_surface
-                      finally:
-                          if process.poll() is None:
-                              process.kill()
+              const cmdRes = rpc('plugin.command', {
+                command_id: 'upload-dropped',
+                context: { source: 'menubar_drop', files: [dropImg] },
+              });
+              requireCond(cmdRes?.ok === true && typeof cmdRes.copy_text === 'string', `${locale}: upload-dropped failed`);
+              checkText(cmdRes.status, locale, `${locale} upload-dropped.status`);
 
-          def validate_staged_package(pkg_dir):
-              check_no_symlinks_tree(pkg_dir)
-              for py_path in sorted(pkg_dir.rglob("*.py")):
-                  if py_path.is_file():
-                      compile(py_path.read_bytes(), str(py_path), "exec")
+              const evRes = rpc('plugin.event', {
+                event: 'note.saved',
+                notebook_root: nbA,
+                path: 'second.md',
+              });
+              requireCond(evRes?.handled === true, `${locale}: note.saved failed`);
 
-              manifest_path = pkg_dir / "manifest.json"
-              require(not os.path.islink(manifest_path) and manifest_path.is_file(), "Staged package missing manifest.json")
-              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-              plugin_id = manifest.get("id")
-              require(isinstance(plugin_id, str) and plugin_id.strip(), "manifest.id is empty")
-              require(plugin_id.strip() != "block-diagnostics", "Reserved plugin id: block-diagnostics")
+              const shut = rpc('plugin.shutdown');
+              requireCond(shut?.ok === true, `${locale}: shutdown failed`);
+              return pages;
+            } finally {
+              fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+          }
 
-              for field in ("name", "summary"):
-                  translations = manifest.get(field)
-                  require(isinstance(translations, dict), f"manifest.{field} must be an object")
-                  for locale in ("zh", "en"):
-                      value = translations.get(locale)
-                      require(isinstance(value, str) and value.strip(), f"manifest.{field}.{locale} is empty")
-                      if locale == "en":
-                          require(not CJK.search(value), f"manifest.{field}.en: Chinese text or punctuation in {value!r}")
+          async function validateStagedPackage(pkgDir) {
+            checkNoSymlinksTree(pkgDir);
+            checkJsSyntax(pkgDir);
 
-              def check_manifest_strings(value):
-                  if isinstance(value, str):
-                      require(not EMOJI.search(value), f"Emoji in manifest: {value!r}")
-                  elif isinstance(value, dict):
-                      for item in (*value.keys(), *value.values()):
-                          check_manifest_strings(item)
-                  elif isinstance(value, list):
-                      for item in value:
-                          check_manifest_strings(item)
+            const manifestPath = path.join(pkgDir, 'manifest.json');
+            const mStat = fs.lstatSync(manifestPath, { throwIfNoEntry: false });
+            requireCond(mStat && !mStat.isSymbolicLink() && mStat.isFile(), 'Staged package missing manifest.json');
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            const pluginId = typeof manifest.id === 'string' ? manifest.id.trim() : '';
+            requireCond(Boolean(pluginId), 'Missing manifest.id');
+            requireCond(pluginId !== 'block-diagnostics', 'Reserved plugin id: block-diagnostics');
 
-              check_manifest_strings(manifest)
-              check_contributes_en(manifest.get("contributes"))
+            for (const field of ['name', 'summary']) {
+              const translations = manifest[field];
+              requireCond(translations && typeof translations === 'object' && !Array.isArray(translations), `manifest.${field} must be an object`);
+              for (const loc of ['zh', 'en']) {
+                const value = translations[loc];
+                requireCond(typeof value === 'string' && value.trim().length > 0, `Missing manifest.${field}.${loc}`);
+                if (loc === 'en') {
+                  requireCond(!CHINESE.test(value), `manifest.${field}.en: Chinese text in ${JSON.stringify(value)}`);
+                }
+              }
+            }
+            checkText(manifest, 'zh', 'manifest');
+            checkContributesEn(manifest.contributes);
 
-              zh = read_strict_readme(pkg_dir, "README.md")
-              en = read_strict_readme(pkg_dir, "README.en.md")
-              require(HAN.search(strip_html_comments(zh)), "README.md must contain visible Chinese text")
-              require(not CJK.search(en), "README.en.md must contain no Chinese text or punctuation")
-              require(re.search(r"[A-Za-z]", strip_html_comments(en)), "README.en.md must contain at least one visible ASCII letter")
-              check_ui(zh, "zh", "README.md")
-              check_ui(en, "en", "README.en.md")
-              require(en != zh, "The two READMEs must differ")
+            const zhReadme = readStrictReadme(pkgDir, 'README.md');
+            const enReadme = readStrictReadme(pkgDir, 'README.en.md');
+            requireCond(HAN.test(stripHtmlComments(zhReadme)), 'README.md must contain visible Chinese text');
+            requireCond(!CHINESE.test(enReadme), 'README.en.md must contain English-only text');
+            requireCond(/[A-Za-z]/.test(stripHtmlComments(enReadme)), 'README.en.md must contain at least one visible ASCII letter');
+            checkText(zhReadme, 'zh', 'README.md');
+            checkText(enReadme, 'en', 'README.en.md');
+            requireCond(zhReadme !== enReadme, 'The two README files must differ');
 
-              surfaces = declared_surfaces(manifest)
-              entry = resolve_entry_command(pkg_dir, manifest)
+            const surfaces = declaredSurfaces(manifest);
+            resolveEntryJS(pkgDir, manifest);
+            const zhPages = await runJsSmokeLocale(pkgDir, manifest.entry.js, 'zh', pluginId, surfaces);
+            const enPages = await runJsSmokeLocale(pkgDir, manifest.entry.js, 'en', pluginId, surfaces);
+            for (const surface of surfaces) {
+              requireCond(zhPages[surface].title !== enPages[surface].title, `${surface}: Chinese and English page titles must differ`);
+              requireCond(JSON.stringify(zhPages[surface]) !== JSON.stringify(enPages[surface]), `${surface}: Chinese and English rendered pages must differ`);
+            }
+            console.log('Bilingual release gate passed on staged dist package.');
+          }
 
-              with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                  zh_future = pool.submit(exercise, entry, pkg_dir, "zh", surfaces)
-                  en_future = pool.submit(exercise, entry, pkg_dir, "en", surfaces)
-                  zh_pages = zh_future.result()
-                  en_pages = en_future.result()
-              for surface in surfaces:
-                  require(zh_pages[surface]["title"] != en_pages[surface]["title"],
-                          f"{surface}: Chinese and English page titles must differ")
-                  require(zh_pages[surface] != en_pages[surface],
-                          f"{surface}: Chinese and English rendered pages must differ")
-              print("Bilingual release gate passed on staged dist package.")
+          function parseVer(tag) {
+            const m = String(tag || '').trim().match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+            return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+          }
 
-          repo = os.environ["REPO"]
-          event = os.environ["EVENT_NAME"]
-          ref_name = os.environ["REF_NAME"]
-          force = os.environ.get("FORCE") == "true"
-          shanghai = datetime.timezone(datetime.timedelta(hours=8))
+          function cmpVer(a, b) {
+            for (let i = 0; i < 3; i += 1) {
+              if (a[i] !== b[i]) return a[i] - b[i];
+            }
+            return 0;
+          }
 
-          def sh(*args):
-              return subprocess.check_output(args, text=True).strip()
+          function resolveTagSha(repo, rel) {
+            if (!rel) return '';
+            const tag = rel.tag_name;
+            try {
+              const s = sh('git', ['rev-parse', `${tag}^{commit}`]);
+              if (/^[0-9a-f]{40}$/.test(s)) return s;
+            } catch {}
+            try {
+              const s = sh('gh', ['api', `repos/${repo}/commits/${tag}`, '--jq', '.sha']);
+              if (/^[0-9a-f]{40}$/.test(s)) return s;
+            } catch {}
+            return '';
+          }
 
-          def summary(msg):
-              print(msg)
-              s_path = os.environ.get("GITHUB_STEP_SUMMARY")
-              if s_path:
-                  with open(s_path, "a", encoding="utf-8") as f:
-                      f.write(msg + "\n")
+          function shanghaiDate(date) {
+            return new Intl.DateTimeFormat('en-CA', {
+              timeZone: 'Asia/Shanghai',
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+            }).format(date);
+          }
 
-          def set_output(**kwargs):
-              o_path = os.environ.get("GITHUB_OUTPUT")
-              if o_path:
-                  with open(o_path, "a", encoding="utf-8") as f:
-                      for k, v in kwargs.items():
-                          f.write(f"{k}={v}\n")
+          const repo = process.env.REPO;
+          const event = process.env.EVENT_NAME;
+          const refName = process.env.REF_NAME;
+          const force = process.env.FORCE === 'true';
 
-          with open("manifest.json", encoding="utf-8") as f:
-              manifest = json.load(f)
-          assert manifest.get("app") == "blockmd", "manifest.app must be 'blockmd'"
-          plugin_id = manifest["id"].strip()
-          assert re.match(r"^[a-z0-9][a-z0-9-]{1,47}$", plugin_id), f"invalid id: {plugin_id}"
-          base_ver = manifest["version"].strip()
-          m_base = re.match(r"^(\d+)\.(\d+)\.(\d+)$", base_ver)
-          assert m_base, f"manifest.version must be X.Y.Z, got {base_ver}"
-          base_major, base_minor = int(m_base.group(1)), int(m_base.group(2))
-          plugin_title = (manifest.get("name", {}).get("en") or plugin_id).strip()
+          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          requireCond(manifest.app === 'blockmd', "manifest.app must be 'blockmd'");
+          const pluginId = String(manifest.id || '').trim();
+          requireCond(/^[a-z0-9][a-z0-9-]{1,47}$/.test(pluginId), `invalid id: ${pluginId}`);
+          const baseVer = String(manifest.version || '').trim();
+          const mBase = baseVer.match(/^(\d+)\.(\d+)\.(\d+)$/);
+          requireCond(Boolean(mBase), `manifest.version must be X.Y.Z, got ${baseVer}`);
+          const baseMajor = Number(mBase[1]);
+          const baseMinor = Number(mBase[2]);
+          const pluginTitle = (manifest.name?.en || pluginId).trim();
 
-          head_sha = sh("git", "rev-parse", "HEAD")
+          const headSha = sh('git', ['rev-parse', 'HEAD']);
+          const rawRels = sh('gh', ['api', '--paginate', `repos/${repo}/releases?per_page=100`, '--jq', '.[]']);
+          const releases = rawRels.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+          const stable = releases
+            .filter((r) => !r.draft && !r.prerelease && parseVer(r.tag_name))
+            .sort((a, b) => cmpVer(parseVer(a.tag_name), parseVer(b.tag_name)));
+          const previous = stable.at(-1) || null;
 
-          def parse_ver(tag):
-              m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (tag or "").strip())
-              return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+          const takenMap = new Map();
+          for (const r of releases) {
+            const pv = parseVer(r.tag_name);
+            if (pv) takenMap.set(pv.join('.'), pv);
+          }
+          for (const t of sh('git', ['tag', '--list', 'v*']).split('\n')) {
+            const pv = parseVer(t);
+            if (pv) takenMap.set(pv.join('.'), pv);
+          }
 
-          releases = []
-          page_num = 1
-          while True:
-              page = json.loads(sh("gh", "api", f"repos/{repo}/releases?per_page=100&page={page_num}"))
-              if not page:
-                  break
-              releases.extend(page)
-              if len(page) < 100:
-                  break
-              page_num += 1
-          stable = [r for r in releases if not r.get("draft") and not r.get("prerelease") and parse_ver(r.get("tag_name"))]
-          stable.sort(key=lambda r: parse_ver(r["tag_name"]))
-          previous = stable[-1] if stable else None
+          let version;
+          let tag;
+          let prevSha = '';
 
-          taken = {parse_ver(r.get("tag_name")) for r in releases if parse_ver(r.get("tag_name"))}
-          for t in sh("git", "tag", "--list", "v*").splitlines():
-              pv = parse_ver(t)
-              if pv:
-                  taken.add(pv)
+          if (event === 'push' && refName.startsWith('v')) {
+            const pv = parseVer(refName);
+            requireCond(Boolean(pv), `Tag ${refName} must match vX.Y.Z`);
+            version = pv.join('.');
+            tag = `v${version}`;
+            const prevForNotes = [...stable].reverse().find((r) => r.tag_name !== tag) || null;
+            prevSha = resolveTagSha(repo, prevForNotes);
+          } else {
+            if (event === 'schedule' && !force && previous?.published_at) {
+              const today = shanghaiDate(new Date());
+              const pubDay = shanghaiDate(new Date(previous.published_at));
+              if (today === pubDay) {
+                summary(`今日（${today}）已发布过 ${previous.tag_name}，每日定时最多自动发布一次，本次跳过。`);
+                setOutput({ should_release: 'no' });
+                process.exit(0);
+              }
+            }
 
-          def resolve_tag_sha(rel):
-              if not rel:
-                  return ""
-              tag = rel["tag_name"]
-              try:
-                  s = sh("git", "rev-parse", f"{tag}^{{commit}}")
-                  if re.match(r"^[0-9a-f]{40}$", s):
-                      return s
-              except Exception:
-                  pass
-              try:
-                  s = sh("gh", "api", f"repos/{repo}/commits/{tag}", "--jq", ".sha")
-                  if re.match(r"^[0-9a-f]{40}$", s):
-                      return s
-              except Exception:
-                  pass
-              return ""
+            prevSha = resolveTagSha(repo, previous);
+            if (prevSha && prevSha === headSha && !force) {
+              summary(`当前 HEAD (${headSha.slice(0, 7)}) 与最新 Release ${previous.tag_name} 一致，跳过发版。`);
+              setOutput({ should_release: 'no' });
+              process.exit(0);
+            }
 
-          if event == "push" and ref_name.startswith("v"):
-              pv = parse_ver(ref_name)
-              assert pv, f"Tag {ref_name} must match vX.Y.Z"
-              version = f"{pv[0]}.{pv[1]}.{pv[2]}"
-              tag = f"v{version}"
-              prev_for_notes = next((r for r in reversed(stable) if r["tag_name"] != tag), None)
-              prev_sha = resolve_tag_sha(prev_for_notes)
-          else:
-              if event == "schedule" and not force and previous and previous.get("published_at"):
-                  today = datetime.datetime.now(shanghai).strftime("%Y-%m-%d")
-                  pub_dt = datetime.datetime.fromisoformat(previous["published_at"].replace("Z", "+00:00")).astimezone(shanghai)
-                  if today == pub_dt.strftime("%Y-%m-%d"):
-                      summary(f"今日（{today}）已发布过 {previous['tag_name']}，每日定时最多自动发布一次，本次跳过。")
-                      set_output(should_release="no")
-                      sys.exit(0)
+            if (prevSha && !force && succeeds('git', ['merge-base', '--is-ancestor', prevSha, headSha])) {
+              const changed = sh('git', ['diff', '--name-only', prevSha, headSha])
+                .split('\n')
+                .filter((p) => p && !p.startsWith('.github/') && p !== '.gitignore' && p !== 'LICENSE');
+              if (changed.length === 0) {
+                summary(`自 ${previous.tag_name} 以来仅包含 CI 或仓库元数据变更，无需发包，本次跳过。`);
+                setOutput({ should_release: 'no' });
+                process.exit(0);
+              }
+              const subjects = sh('git', ['log', '--no-merges', '--format=%s', `${prevSha}..${headSha}`])
+                .split('\n')
+                .filter((s) => s.length > 0);
+              if (subjects.length > 0 && subjects.every((s) => s.toLowerCase().includes('[skip release]'))) {
+                summary('区间内提交均标记 [skip release]，本次跳过。');
+                setOutput({ should_release: 'no' });
+                process.exit(0);
+              }
+            }
 
-              prev_sha = resolve_tag_sha(previous)
-              if prev_sha and prev_sha == head_sha and not force:
-                  summary(f"当前 HEAD ({head_sha[:7]}) 与最新 Release {previous['tag_name']} 一致，跳过发版。")
-                  set_output(should_release="no")
-                  sys.exit(0)
+            const commitCount = Number(sh('git', ['rev-list', '--count', headSha]));
+            let cand = [baseMajor, baseMinor, commitCount];
+            let highest = null;
+            for (const pv of takenMap.values()) {
+              if (!highest || cmpVer(pv, highest) > 0) highest = pv;
+            }
+            if (highest && cmpVer(cand, highest) <= 0) {
+              cand = [highest[0], highest[1], highest[2] + 1];
+            }
+            while (takenMap.has(cand.join('.'))) {
+              cand = [cand[0], cand[1], cand[2] + 1];
+            }
+            version = cand.join('.');
+            tag = `v${version}`;
+          }
 
-              if prev_sha and not force:
-                  is_anc = subprocess.call(["git", "merge-base", "--is-ancestor", prev_sha, head_sha]) == 0
-                  if is_anc:
-                      changed = [
-                          p for p in sh("git", "diff", "--name-only", prev_sha, head_sha).splitlines()
-                          if p and not p.startswith(".github/") and p not in {".gitignore", "LICENSE"}
-                      ]
-                      if not changed:
-                          summary(f"自 {previous['tag_name']} 以来仅包含 CI 或仓库元数据变更，无需发包，本次跳过。")
-                          set_output(should_release="no")
-                          sys.exit(0)
-                      subjects = sh("git", "log", "--no-merges", "--format=%s", f"{prev_sha}..{head_sha}").splitlines()
-                      if subjects and all("[skip release]" in s.lower() for s in subjects):
-                          summary("区间内提交均标记 [skip release]，本次跳过。")
-                          set_output(should_release="no")
-                          sys.exit(0)
+          const notesLines = [];
+          if (prevSha && prevSha !== headSha && succeeds('git', ['merge-base', '--is-ancestor', prevSha, headSha])) {
+            const rawLog = sh('git', ['log', '--no-merges', '--reverse', '--format=%h%x00%s', `${prevSha}..${headSha}`]);
+            for (const line of rawLog.split('\n')) {
+              if (!line.trim()) continue;
+              const [cSha, subj] = line.split('\x00');
+              if (/^(?:ci|docs)(?:\([^)]*\))?:\s/i.test(subj)) continue;
+              notesLines.push(`- ${subj} (\`${cSha}\`)`);
+            }
+          }
+          if (notesLines.length === 0) {
+            notesLines.push(`- Automated release from \`${headSha.slice(0, 7)}\`.`);
+          }
+          fs.writeFileSync('release-notes.md', `## Changes\n\n${notesLines.join('\n')}\n`, 'utf8');
 
-              commit_count = int(sh("git", "rev-list", "--count", head_sha))
-              cand = (base_major, base_minor, commit_count)
-              highest = max(taken) if taken else None
-              if highest and cand <= highest:
-                  cand = (highest[0], highest[1], highest[2] + 1)
-              while cand in taken:
-                  cand = (cand[0], cand[1], cand[2] + 1)
-              version = f"{cand[0]}.{cand[1]}.{cand[2]}"
-              tag = f"v{version}"
+          const pkgDir = path.join('dist', pluginId);
+          fs.rmSync('dist', { recursive: true, force: true });
+          fs.mkdirSync(pkgDir, { recursive: true });
+          const tarBytes = execFileSync('git', ['archive', '--format=tar', headSha]);
+          execFileSync('tar', ['-xf', '-', '-C', pkgDir], { input: tarBytes });
+          fs.rmSync(path.join(pkgDir, '.github'), { recursive: true, force: true });
+          for (const metaFile of ['.gitignore']) {
+            const p = path.join(pkgDir, metaFile);
+            const st = fs.lstatSync(p, { throwIfNoEntry: false });
+            if (st && !st.isSymbolicLink()) {
+              fs.rmSync(p, { force: true });
+            }
+          }
 
-          notes_lines = []
-          if prev_sha and prev_sha != head_sha and subprocess.call(["git", "merge-base", "--is-ancestor", prev_sha, head_sha]) == 0:
-              raw_log = sh("git", "log", "--no-merges", "--reverse", "--format=%h%x00%s", f"{prev_sha}..{head_sha}")
-              for line in raw_log.splitlines():
-                  if not line.strip():
-                      continue
-                  c_sha, subj = line.split("\x00", 1)
-                  if re.match(r"^(?:ci|docs)(?:\([^)]*\))?:\s", subj, re.I):
-                      continue
-                  notes_lines.append(f"- {subj} (`{c_sha}`)")
-          if not notes_lines:
-              notes_lines.append(f"- Automated release from `{head_sha[:7]}`.")
-          with open("release-notes.md", "w", encoding="utf-8") as f:
-              f.write("## Changes\n\n" + "\n".join(notes_lines) + "\n")
+          try {
+            checkNoSymlinksTree(pkgDir);
+          } catch (err) {
+            console.error(`Bilingual release gate failed: ${err.message}`);
+            process.exit(1);
+          }
 
-          pkg_dir = os.path.join("dist", plugin_id)
-          shutil.rmtree("dist", ignore_errors=True)
-          os.makedirs(pkg_dir, exist_ok=True)
-          tar_bytes = subprocess.check_output(["git", "archive", "--format=tar", head_sha])
-          subprocess.run(["tar", "-xf", "-", "-C", pkg_dir], input=tar_bytes, check=True)
-          shutil.rmtree(os.path.join(pkg_dir, ".github"), ignore_errors=True)
-          for meta_file in (".gitignore",):
-              p = os.path.join(pkg_dir, meta_file)
-              if not os.path.islink(p) and os.path.exists(p):
-                  os.remove(p)
+          manifest.version = version;
+          fs.writeFileSync(path.join(pkgDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
-          try:
-              check_no_symlinks_tree(Path(pkg_dir))
-          except Exception as exc:
-              print(f"Bilingual release gate failed: {exc}", file=sys.stderr)
-              sys.exit(1)
+          try {
+            await validateStagedPackage(pkgDir);
+          } catch (err) {
+            console.error(`Bilingual release gate failed: ${err.message}`);
+            process.exit(1);
+          }
 
-          manifest["version"] = version
-          with open(os.path.join(pkg_dir, "manifest.json"), "w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False, indent=2)
-              f.write("\n")
+          const archiveName = `${pluginId}-${tag}.tar.gz`;
+          execFileSync('tar', ['-czf', archiveName, '-C', 'dist', pluginId]);
 
-          try:
-              validate_staged_package(Path(pkg_dir))
-          except Exception as exc:
-              print(f"Bilingual release gate failed: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          archive_name = f"{plugin_id}-{tag}.tar.gz"
-          subprocess.check_call(["tar", "-czf", archive_name, "-C", "dist", plugin_id])
-
-          summary(f"准备发布 {plugin_title} {tag} (archive={archive_name}, commit={head_sha[:7]})")
-          set_output(
-              should_release="yes",
-              version=version,
-              tag=tag,
-              title=f"{plugin_title} {version}",
-              archive=archive_name,
-              head_sha=head_sha,
-          )
-          PY
+          summary(`准备发布 ${pluginTitle} ${tag} (archive=${archiveName}, commit=${headSha.slice(0, 7)})`);
+          setOutput({
+            should_release: 'yes',
+            version,
+            tag,
+            title: `${pluginTitle} ${version}`,
+            archive: archiveName,
+            head_sha: headSha,
+          });
+          NODE
 
       # 更新说明只经 tailnet 用 Magpie：Mac 在线先用 Mac 的 agy-cli/gemini-3.8-flash，再 VPS gpt-6-luna，最后 deepseek-flash。
       # 与 Block 主仓 scripts/release/release-notes.mjs 的顺序保持一致；不要用 Google AI Studio key。
