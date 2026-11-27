@@ -577,6 +577,12 @@ export function isStatRegularFile(statRes) {
   if (!isPlainObject(statRes) || statRes.exists === false) {
     return false;
   }
+  if (statRes.is_icloud_placeholder === true || statRes.is_symlink === true) {
+    return false;
+  }
+  if (typeof statRes.is_regular === 'boolean') {
+    return statRes.is_regular;
+  }
   if (typeof statRes.is_file === 'boolean') {
     return statRes.is_file;
   }
@@ -588,7 +594,7 @@ export function isStatRegularFile(statRes) {
 
 export function extractAssetTimestampSec(statRes) {
   if (isPlainObject(statRes)) {
-    for (const key of ['birthtime_ms', 'mtime_ms']) {
+    for (const key of ['birthtime_ms', 'mtime_ms', 'mod_time_ms']) {
       const val = Number(statRes[key]);
       if (Number.isFinite(val) && val > 0) {
         return val / 1000;
@@ -600,7 +606,7 @@ export function extractAssetTimestampSec(statRes) {
         return val;
       }
     }
-    for (const key of ['birthtime', 'mtime']) {
+    for (const key of ['birthtime', 'mtime', 'mod_time']) {
       const raw = statRes[key];
       if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
         return raw > 1e12 ? raw / 1000 : raw;
@@ -640,7 +646,9 @@ export function resolveLocalFile(nbRoot, notePath, relAssetPath) {
       const st = callHost('host.fs.stat', { path: cand });
       if (isStatRegularFile(st)) {
         const realPath =
-          typeof st.real_path === 'string' && st.real_path.trim() ? st.real_path.trim() : cand;
+          (typeof st.real_path === 'string' && st.real_path.trim()) ||
+          (typeof st.path === 'string' && st.path.trim()) ||
+          cand;
         return { localPath: realPath, size: extractStatSize(st) };
       }
     } catch {

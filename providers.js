@@ -733,12 +733,20 @@ export function uploadFile(config, creds, nbRoot, notePath, localPath) {
   }
 
   const readRes = callHost('host.fs.read', { path: localPath, encoding: 'base64' });
-  const fileB64 = String((isPlainObject(readRes) ? readRes.content ?? readRes.base64 ?? readRes.data : '') || '');
-  const byteLen = base64DecodedByteLength(fileB64);
-  const blobB64 = prependAsciiToBase64(`blob ${byteLen}\0`, fileB64);
-  const blobSha1 = sha1Hex({ base64: blobB64 });
+  const fileB64 = String(
+    (isPlainObject(readRes)
+      ? readRes.content_base64 ?? readRes.content ?? readRes.base64 ?? readRes.data
+      : '') || '',
+  );
+  let needUpload = !existingSha;
+  if (!needUpload) {
+    const byteLen = base64DecodedByteLength(fileB64);
+    const blobB64 = prependAsciiToBase64(`blob ${byteLen}\0`, fileB64);
+    const blobSha1 = sha1Hex({ base64: blobB64 });
+    needUpload = existingSha !== blobSha1;
+  }
 
-  if (existingSha !== blobSha1) {
+  if (needUpload) {
     const payload = {
       message: `chore(image-host): upload ${basename(localPath)}`,
       content: fileB64,
@@ -750,7 +758,10 @@ export function uploadFile(config, creds, nbRoot, notePath, localPath) {
     githubApiRequest(creds, 'PUT', apiUrl, payload);
   }
 
-  const branchQuoted = encodeURIComponent(creds.branch);
+  const branchQuoted = creds.branch
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
   if (creds.gh_cdn === 'jsdelivr') {
     return `https://cdn.jsdelivr.net/gh/${creds.owner}/${creds.repo}@${branchQuoted}/${encodedPath}`;
   }
