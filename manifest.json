@@ -12,15 +12,11 @@
   "author": "Block Community",
   "repo": "blockmd-plugins/block-image-host",
   "summary": {
-    "zh": "支持 Cloudflare R2、S3 兼容存储与 GitHub 仓库的笔记图片自动上传",
-    "en": "Upload local note images to Cloudflare R2, S3-compatible storage, or GitHub"
+    "zh": "自动把本地图片传到云端图床并换好链接，发博客或换电脑都不裂图",
+    "en": "Auto-upload note images to your own cloud storage and swap in live links like PicGo"
   },
   "entry": {
-    "command": [
-      "python3",
-      "-u",
-      "main.py"
-    ]
+    "js": "main.js"
   },
   "permissions": [
     "storage",
@@ -28,6 +24,7 @@
     "notes:write",
     "network",
     "events:note_saved",
+    "system:fs",
     "system:clipboard_read",
     "system:clipboard_write",
     "ui:menubar",
@@ -35,40 +32,44 @@
   ],
   "permission_reasons": {
     "storage": {
-      "zh": "保存图床服务商凭证、命名规则与上传记录",
-      "en": "Save image host credentials, naming rules, and upload logs"
+      "zh": "保存你的图床账号配置、存放路径模板与近期上传记录",
+      "en": "Save your image host settings, path templates, and recent upload history"
     },
     "notes:read": {
-      "zh": "读取笔记正文与本地图片引用，筛选需要上传的图片",
-      "en": "Read note content and local image links to find images to upload"
+      "zh": "扫描笔记里的本地图片路径，找出需要上传的图片",
+      "en": "Scan notes for local image links that need to be uploaded"
     },
     "notes:write": {
-      "zh": "图片上传成功后将笔记中的本地路径替换为远程图床链接",
-      "en": "Replace local image paths with uploaded remote URLs in notes"
+      "zh": "上传完成后把笔记里的本地图片路径自动换成在线链接",
+      "en": "Replace local image paths in notes with live URLs after upload"
     },
     "network": {
-      "zh": "向 Cloudflare R2、S3 兼容存储或 GitHub 仓库上传图片",
-      "en": "Upload images to Cloudflare R2, S3-compatible storage, or GitHub"
+      "zh": "把图片上传到 GitHub、Cloudflare R2 或 S3 等云存储",
+      "en": "Upload images to GitHub, Cloudflare R2, AWS S3, or S3-compatible storage"
     },
     "events:note_saved": {
-      "zh": "在保存笔记时自动检测并上传其中的本地图片",
-      "en": "Automatically detect and upload local images when a note is saved"
+      "zh": "保存笔记时自动检测并上传新插入的本地图片",
+      "en": "Automatically detect and upload new local images when you save a note"
+    },
+    "system:fs": {
+      "zh": "校验并读取笔记目录、拖入或剪贴板中的本地图片文件以供上传",
+      "en": "Check and read local image files from notebooks, drops, or the clipboard for upload"
     },
     "system:clipboard_read": {
-      "zh": "点击菜单栏「上传剪贴板」时读取剪贴板中的图片或图片文件",
-      "en": "Read clipboard images or image files when clicking Upload Clipboard in the menu bar"
+      "zh": "点菜单栏上传剪贴板时，读取你刚复制的截图或图片文件",
+      "en": "Read screenshots or image files from your clipboard when uploading from the menu bar"
     },
     "system:clipboard_write": {
-      "zh": "上传完成或点击最近记录时将远程图片链接写入剪贴板",
-      "en": "Copy uploaded image URLs or recent links to the clipboard"
+      "zh": "上传完成或点击最近记录时，自动把图片外链复制到剪贴板",
+      "en": "Copy the uploaded link or a recent upload URL straight to your clipboard"
     },
     "ui:menubar": {
-      "zh": "在系统菜单栏显示上传图标，接收拖入或剪贴板图片并列出最近上传",
-      "en": "Show a menu bar icon to upload dropped or clipboard images and list recent uploads"
+      "zh": "在顶部菜单栏显示上传入口，支持拖图上传与查看最近记录",
+      "en": "Add a menu bar icon for drag-and-drop uploads, clipboard uploads, and recent links"
     },
     "ui:commands": {
-      "zh": "注册上传剪贴板、上传拖入文件与复制最近链接命令",
-      "en": "Register commands for clipboard upload, dropped upload, and copying recent links"
+      "zh": "提供上传剪贴板、上传拖入图片和复制最近链接的快捷命令",
+      "en": "Provide commands for clipboard upload, dropped-file upload, and copying recent links"
     }
   },
   "surfaces": [
