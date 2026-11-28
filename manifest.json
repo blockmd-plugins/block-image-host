@@ -68,8 +68,8 @@
       "en": "Add a menu bar icon for drag-and-drop uploads, clipboard uploads, and recent links"
     },
     "ui:commands": {
-      "zh": "提供上传剪贴板、上传拖入图片和复制最近链接的快捷命令",
-      "en": "Provide commands for clipboard upload, dropped-file upload, and copying recent links"
+      "zh": "响应顶部菜单栏上传剪贴板、拖入上传和复制最近链接等操作",
+      "en": "Handle menu bar clipboard uploads, dropped-file uploads, and copying recent links"
     }
   },
   "surfaces": [
@@ -82,21 +82,24 @@
         "title": {
           "zh": "上传剪贴板图片",
           "en": "Upload Clipboard Image"
-        }
+        },
+        "hidden": true
       },
       {
         "id": "upload-dropped",
         "title": {
           "zh": "上传拖入图片",
           "en": "Upload Dropped Images"
-        }
+        },
+        "hidden": true
       },
       {
         "id": "copy-link",
         "title": {
           "zh": "复制最近上传链接",
           "en": "Copy Recent Upload Link"
-        }
+        },
+        "hidden": true
       }
     ],
     "menubar_items": [
